@@ -1,0 +1,21 @@
+# Local test / audit artifacts (kept out of the public repo)
+_audit.ps1
+_smoke.ps1
+_smoke.html
+_test_*.ps1
+
+# Customer-specific audit report (internal delivery doc)
+AUDIT_REPORT.md
+
+# Runtime outputs
+StorageOptimizer_*.html
+StorageOptimizer_*.html.sha256
+StorageOptimizer_snapshot_*.json
+checkpoint.json
+StorageAccount_Optimizer/
+
+# Editor / OS scaffolding
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
