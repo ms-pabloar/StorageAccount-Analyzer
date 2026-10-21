@@ -58,7 +58,7 @@
 
 .NOTES
     Author  : DSE-AI FY27
-    Version : 1.0.0
+    Version : 1.1.0
     Modules : Az.Accounts, Az.Storage, Az.Monitor, Az.ResourceGraph (>= latest)
     Runtime : PowerShell 7.2+ (Cloud Shell default)
 #>
@@ -96,7 +96,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'Continue'
 $script:StartTime      = Get-Date
-$script:ScriptVersion  = '1.0.0'
+$script:ScriptVersion  = '1.1.0'
 
 function Write-Log {
     param(
@@ -224,13 +224,14 @@ if ($DryRun) {
 
 #region ------------------------------------------------------------- Analysis helpers
 
-# Approx public list prices (USD, East US, Hot LRS) used ONLY as directional
-# indicators for potential-savings estimates. Real billing depends on region,
-# reservations, EA/CSP discounts, etc. The report clearly labels these as
-# ESTIMATES.
+# Approx public list prices (USD, East US, LRS, General Block Blob v2) used ONLY as
+# directional indicators for potential-savings estimates. Real billing depends on
+# region, reservations, EA/CSP discounts, etc. The report clearly labels these as
+# ESTIMATES. Defaults were checked against the Azure Retail Prices API (East US,
+# 2026-10-21); use -PricingOverride to inject negotiated / regional prices.
 $script:Pricing = [ordered]@{
-    CapacityGBMonth_Hot     = 0.0184
-    CapacityGBMonth_Cool    = 0.0100
+    CapacityGBMonth_Hot     = 0.0208
+    CapacityGBMonth_Cool    = 0.0152
     CapacityGBMonth_Cold    = 0.0036
     CapacityGBMonth_Archive = 0.00099
     # per 10,000 ops
@@ -240,8 +241,15 @@ $script:Pricing = [ordered]@{
     TxWrite_Archive = 0.1000
     TxRead_Hot      = 0.0040
     TxRead_Cool     = 0.0100
-    TxRead_Cold     = 0.0100
-    TxRead_Archive  = 6.5000
+    TxRead_Cold     = 0.1000
+    TxRead_Archive  = 5.0000
+    # "All other operations" (GetBlobProperties, SetBlobMetadata, leases, ...) are billed at
+    # the same rate in every tier.
+    TxOther         = 0.0040
+    # per GB read from the tier (Hot has no retrieval charge)
+    DataRetrievalGB_Cool    = 0.0100
+    DataRetrievalGB_Cold    = 0.0300
+    DataRetrievalGB_Archive = 0.0200
     # Cool / Cold billing minimums per PUT operation (blob smaller than this is billed as if it were this big).
     # Source: Azure Blob Storage pricing pages. This is the trap that hit the BOLD case.
     MinBillableBlobKB_Cool = 128
@@ -260,22 +268,22 @@ $script:Pricing = [ordered]@{
     RedundancyMultiplier = @{
         'Standard_LRS'   = 1.00
         'Standard_ZRS'   = 1.25
-        'Standard_GRS'   = 2.00
-        'Standard_RAGRS' = 2.50
-        'Standard_GZRS'  = 2.50
-        'Standard_RAGZRS'= 3.13
+        'Standard_GRS'   = 2.20
+        'Standard_RAGRS' = 2.83
+        'Standard_GZRS'  = 2.25
+        'Standard_RAGZRS'= 2.81
         'Premium_LRS'    = 1.00
         'Premium_ZRS'    = 1.25
     }
     # Geo-write transaction multiplier: geo-redundant SKUs replicate every write, so write ops
-    # are billed against BOTH primary + secondary regions (~2x for GRS/RAGRS/GZRS/RAGZRS).
+    # are billed against BOTH primary + secondary regions (~2x for GRS/RAGRS, ~2.35x for GZRS/RAGZRS).
     GeoWriteMultiplier = @{
         'Standard_LRS'   = 1.00
         'Standard_ZRS'   = 1.00
         'Standard_GRS'   = 2.00
         'Standard_RAGRS' = 2.00
-        'Standard_GZRS'  = 2.00
-        'Standard_RAGZRS'= 2.00
+        'Standard_GZRS'  = 2.35
+        'Standard_RAGZRS'= 2.35
         'Premium_LRS'    = 1.00
         'Premium_ZRS'    = 1.00
     }
@@ -318,11 +326,29 @@ function Get-TierCapacityPrice {
     }
 }
 
+function Get-TierRetrievalPrice {
+    param([string] $Tier)
+    switch ($Tier) {
+        'Cool'    { return $script:Pricing.DataRetrievalGB_Cool }
+        'Cold'    { return $script:Pricing.DataRetrievalGB_Cold }
+        'Archive' { return $script:Pricing.DataRetrievalGB_Archive }
+        default   { return 0.0 }
+    }
+}
+
 function Get-TierCostBreakdown {
     <#
         Estimates the monthly $ cost of a Standard StorageV2 account at a given tier,
-        given observed capacity (GB), monthly reads/writes, monthly ingress bytes
-        (for the 128 KB minimum-billable penalty) and the redundancy SKU.
+        given observed capacity (GB), the monthly operation mix (reads, writes,
+        list/create-container, other), monthly ingress / egress bytes and the
+        redundancy SKU.
+
+        Operation billing follows the Azure Blob Storage meters:
+          - Write and "List and create container" operations are billed at the write rate.
+          - Read operations are billed at the tier read rate.
+          - "Other" operations are billed at a flat rate in every tier.
+          - Cool/Cold also bill a per-GB data retrieval charge; egress bytes are used as
+            the estimate of data read from the account.
 
         Also estimates the "early-deletion penalty" for Cool/Cold tiers: any data
         moved into Cool/Cold and then deleted or moved back before the minimum
@@ -335,8 +361,10 @@ function Get-TierCostBreakdown {
         [double] $CapacityGB      = 0,
         [double] $MonthlyReads    = 0,
         [double] $MonthlyWrites   = 0,
+        [double] $MonthlyListOps  = 0,
+        [double] $MonthlyOtherOps = 0,
         [double] $MonthlyIngressBytes = 0,
-        [double] $MonthlyEgressBytes  = 0,       # used to estimate delete/overwrite churn
+        [double] $MonthlyEgressBytes  = 0,
         [string] $Sku             = 'Standard_LRS'
     )
 
@@ -349,8 +377,10 @@ function Get-TierCostBreakdown {
     $writePrice = switch ($Tier) { 'Hot' { $script:Pricing.TxWrite_Hot } 'Cool' { $script:Pricing.TxWrite_Cool } 'Cold' { $script:Pricing.TxWrite_Cold } }
     $readPrice  = switch ($Tier) { 'Hot' { $script:Pricing.TxRead_Hot  } 'Cool' { $script:Pricing.TxRead_Cool  } 'Cold' { $script:Pricing.TxRead_Cold  } }
 
-    $writeOpsCost = ($MonthlyWrites / 10000.0) * $writePrice * $geoWriteMult
+    $writeOpsCost = (($MonthlyWrites + $MonthlyListOps) / 10000.0) * $writePrice * $geoWriteMult
     $readOpsCost  = ($MonthlyReads  / 10000.0) * $readPrice
+    $otherOpsCost = ($MonthlyOtherOps / 10000.0) * $script:Pricing.TxOther
+    $retrievalCost = ($MonthlyEgressBytes / 1GB) * (Get-TierRetrievalPrice $Tier)
 
     # 128 KB minimum-billable-blob penalty for Cool/Cold write CAPACITY.
     # We estimate the average blob size written in the month from Ingress / write ops.
@@ -393,9 +423,11 @@ function Get-TierCostBreakdown {
         CapacityCost       = [math]::Round($capacityCost, 2)
         ReadOpsCost        = [math]::Round($readOpsCost, 2)
         WriteOpsCost       = [math]::Round($writeOpsCost, 2)
+        OtherOpsCost       = [math]::Round($otherOpsCost, 2)
+        RetrievalCost      = [math]::Round($retrievalCost, 2)
         SmallWritePenalty  = [math]::Round($smallWritePenalty, 2)
         RetentionPenalty   = [math]::Round($retentionPenalty, 2)
-        TotalCost          = [math]::Round($capacityCost + $readOpsCost + $writeOpsCost + $smallWritePenalty + $retentionPenalty, 2)
+        TotalCost          = [math]::Round($capacityCost + $readOpsCost + $writeOpsCost + $otherOpsCost + $retrievalCost + $smallWritePenalty + $retentionPenalty, 2)
     }
 }
 
@@ -415,6 +447,10 @@ function Get-TierRecommendationReason {
         [Parameter(Mandatory)] [string] $CurrentTier,
         [double] $MonthlyReads   = 0,
         [double] $MonthlyWrites  = 0,
+        [double] $MonthlyListOps = 0,
+        [double] $MonthlyOtherOps = 0,
+        [double] $MonthlyIngressBytes = 0,
+        [double] $MonthlyEgressBytes  = 0,
         [double] $CapacityGB     = 0,
         [int]    $MetricsDays    = 30
     )
@@ -424,10 +460,13 @@ function Get-TierRecommendationReason {
     if (-not $current) { $current = $best }
 
     $delta       = [math]::Round($current.TotalCost - $best.TotalCost, 2)
-    $mTx         = $MonthlyReads + $MonthlyWrites
+    $mTx         = $MonthlyReads + $MonthlyWrites + $MonthlyListOps + $MonthlyOtherOps
     $txPerGB     = if ($CapacityGB -gt 0) { $mTx / $CapacityGB } else { 0 }
-    $writeShare  = if ($mTx -gt 0) { $MonthlyWrites / $mTx } else { 0 }
-    $avgKB       = $best.AvgBlobSizeKB
+    $writeShare  = if ($mTx -gt 0) { ($MonthlyWrites + $MonthlyListOps) / $mTx } else { 0 }
+    $avgKB       = ($Projections | Where-Object { $_.AvgBlobSizeKB } | Select-Object -First 1).AvgBlobSizeKB
+    $egressGB    = $MonthlyEgressBytes / 1GB
+    $capRatioCool = [math]::Round($script:Pricing.CapacityGBMonth_Hot / $script:Pricing.CapacityGBMonth_Cool, 1)
+    $capRatioCold = [math]::Round($script:Pricing.CapacityGBMonth_Hot / $script:Pricing.CapacityGBMonth_Cold, 1)
 
     # --- Data source: short one-liner. Full metric definition lives in $metricsUsed
     #     so the UI can hide it under a "View metrics used" toggle.
@@ -437,7 +476,11 @@ function Get-TierRecommendationReason {
     $obs = New-Object System.Collections.Generic.List[string]
     $obs.Add(("Data stored: {0:N2} GB." -f $CapacityGB))
     $obs.Add(("Read operations: {0:N0} per month." -f $MonthlyReads))
-    $obs.Add(("Write operations: {0:N0} per month." -f $MonthlyWrites))
+    $obs.Add(("Write operations: {0:N0} per month; list / create-container operations (billed at the write rate): {1:N0}." -f $MonthlyWrites,$MonthlyListOps))
+    $obs.Add(("Other operations (properties, metadata, leases, unclassified): {0:N0} per month." -f $MonthlyOtherOps))
+    if ($egressGB -gt 0) {
+        $obs.Add(("Data read (egress): {0:N2} GB per month; Cool and Cold bill a per-GB data retrieval charge on it." -f $egressGB))
+    }
     if ($avgKB -and $MonthlyWrites -gt 0) {
         $obs.Add(("Average size per written blob: {0:N1} KB (Ingress bytes divided by write operations)." -f $avgKB))
     }
@@ -445,7 +488,7 @@ function Get-TierRecommendationReason {
         $obs.Add(("Access intensity: {0:N1} operations per GB of stored data." -f $txPerGB))
     }
     if ($writeShare -gt 0) {
-        $obs.Add(("Write share: {0:P0} of all operations are writes." -f $writeShare))
+        $obs.Add(("Write share: {0:P0} of all operations are writes or list / create-container calls." -f $writeShare))
     }
 
     # --- Full metric reference (Azure Monitor names + ApiName filters). Rendered
@@ -454,21 +497,28 @@ function Get-TierRecommendationReason {
     $metricsUsed = @(
         "Namespace: Microsoft.Storage/storageAccounts",
         "UsedCapacity - aggregation Average, last daily value in the observation window.",
-        "Transactions - aggregation Total, split by the ApiName dimension:",
-        "  * Read APIs classified: GetBlob, ListBlobs, GetBlobProperties, GetBlobMetadata, GetContainerProperties, GetContainerACL, GetTableEntity, QueryEntities, QueryTable, GetMessage, PeekMessage.",
-        "  * Write APIs classified: PutBlob, PutBlock, PutBlockList, SetBlobProperties, SetBlobMetadata, SetBlobTier, WriteFile, CreateFile, InsertEntity, UpdateEntity, MergeEntity, PutMessage, CreateContainer, SetContainerACL, SetContainerMetadata.",
-        "  * Anything else is counted as Other and excluded from the read/write ratios above.",
+        "Transactions - aggregation Total, split by the ApiName dimension and classified with the Azure Blob Storage operation-to-price mapping (learn.microsoft.com/azure/storage/blobs/map-rest-apis-transaction-categories):",
+        "  * Read: GetBlob, QueryBlobContents, Data Lake ReadFile / GetFileProperties / GetPathStatus.",
+        "  * Write: PutBlob, PutBlock, PutBlockList, AppendBlock, CopyBlob, SetBlobTier, UndeleteBlob, SealBlob, Data Lake Create / Append / Flush / Rename / SetProperties.",
+        "  * List and create container (billed at the write rate): ListBlobs, ListContainers, CreateContainer, FindBlobsByTags, RestoreContainer.",
+        "  * Other (flat rate in every tier): GetBlobProperties, GetBlobMetadata, SetBlobMetadata, SetBlobProperties, leases, snapshots, tags, container metadata. Unrecognised ApiName values are also priced as Other and flagged in the account's data-quality finding.",
+        "  * Free (not billed): DeleteBlob, DeleteContainer and Data Lake delete operations. Table / Queue / File service operations are excluded from the blob meters.",
         "Ingress - aggregation Total, in bytes. Used to estimate average written blob size.",
+        "Egress - aggregation Total, in bytes. Used as the estimate of data read for the Cool / Cold per-GB retrieval charge.",
         "Observation window: last $MetricsDays days. Monthly totals shown in the report are the observed sums scaled to 30 days."
     )
 
     # --- Interpretation (why the observed pattern favors the recommended tier) ---
     $interp = switch ($best.Tier) {
         'Hot' {
-            $t = "The workload is chatty: with {0:N0} operations per month against only {1:N2} GB of stored data, each operation matters more than each GB. Cool and Cold tiers charge roughly {2}x per read and {3}-{4}x per write compared to Hot, which more than cancels out their cheaper capacity." -f $mTx,$CapacityGB,
+            $t = "The workload is active: with {0:N0} operations per month against only {1:N2} GB of stored data, each operation matters more than each GB. Cool and Cold charge roughly {2}x-{3}x per read and {4}x-{5}x per write compared to Hot, which more than cancels out their cheaper capacity." -f $mTx,$CapacityGB,
                 [math]::Round($script:Pricing.TxRead_Cool/$script:Pricing.TxRead_Hot,1),
+                [math]::Round($script:Pricing.TxRead_Cold/$script:Pricing.TxRead_Hot,1),
                 [math]::Round($script:Pricing.TxWrite_Cool/$script:Pricing.TxWrite_Hot,1),
                 [math]::Round($script:Pricing.TxWrite_Cold/$script:Pricing.TxWrite_Hot,1)
+            if ($egressGB -gt 0 -and ($script:Pricing.DataRetrievalGB_Cool * $egressGB) -ge 1) {
+                $t += " Cool and Cold also bill a per-GB retrieval charge on the {0:N2} GB read each month, which Hot does not." -f $egressGB
+            }
             if ($writeShare -ge 0.5 -and $mTx -gt 100000) {
                 $t += " On top of that, this account is write-heavy ({0:P0} of ops are writes), which is exactly the pattern the Cool/Cold surcharges hit hardest." -f $writeShare
             }
@@ -478,10 +528,10 @@ function Get-TierRecommendationReason {
             $t
         }
         'Cool' {
-            "The workload is dormant: {0:N2} GB of stored data with only {1:N0} operations per month. At that access rate, Cool's roughly 1.8x cheaper capacity price outweighs its 2x-2.5x higher per-operation price. In practice: the account pays mostly for storage, not for API calls." -f $CapacityGB,$mTx
+            "The workload is dormant: {0:N2} GB of stored data with only {1:N0} operations per month. At that access rate, Cool's roughly {2}x cheaper capacity price outweighs its higher per-operation and per-GB retrieval prices. In practice: the account pays mostly for storage, not for API calls." -f $CapacityGB,$mTx,$capRatioCool
         }
         'Cold' {
-            "The workload is essentially archival: {0:N2} GB of stored data with only {1:N0} operations per month. Cold's roughly 5x cheaper capacity price wins by a wide margin at this access level, even after accounting for the higher per-operation charges and the 128 KB write minimum." -f $CapacityGB,$mTx
+            "The workload is essentially archival: {0:N2} GB of stored data with only {1:N0} operations per month. Cold's roughly {2}x cheaper capacity price wins by a wide margin at this access level, even after accounting for the higher per-operation charges, the per-GB retrieval charge and the 128 KB write minimum." -f $CapacityGB,$mTx,$capRatioCold
         }
     }
 
@@ -531,13 +581,16 @@ function Get-SkuRecommendationReason {
         [double] $CapacityGB    = 0,
         [double] $MonthlyReads  = 0,
         [double] $MonthlyWrites = 0,
+        [double] $MonthlyListOps = 0,
+        [double] $MonthlyOtherOps = 0,
         [double] $MonthlyIngressBytes = 0,
+        [double] $MonthlyEgressBytes  = 0,
         [int]    $MetricsDays   = 30
     )
 
     # Only Standard SKUs are analyzed (Premium is a different pricing model).
-    $skuOptions = @('Standard_LRS','Standard_ZRS','Standard_GRS','Standard_RAGRS')
-    if ($CurrentSku -notin $skuOptions -and -not $CurrentSku.StartsWith('Standard_')) {
+    $skuOptions = @('Standard_LRS','Standard_ZRS','Standard_GRS','Standard_RAGRS','Standard_GZRS','Standard_RAGZRS')
+    if ($CurrentSku -notin $skuOptions) {
         return $null
     }
 
@@ -545,7 +598,8 @@ function Get-SkuRecommendationReason {
     $breakdowns = @{}
     foreach ($sku in $skuOptions) {
         $breakdowns[$sku] = Get-TierCostBreakdown -Tier $CurrentTier -CapacityGB $CapacityGB `
-            -MonthlyReads $MonthlyReads -MonthlyWrites $MonthlyWrites -MonthlyIngressBytes $MonthlyIngressBytes -Sku $sku
+            -MonthlyReads $MonthlyReads -MonthlyWrites $MonthlyWrites -MonthlyListOps $MonthlyListOps -MonthlyOtherOps $MonthlyOtherOps `
+            -MonthlyIngressBytes $MonthlyIngressBytes -MonthlyEgressBytes $MonthlyEgressBytes -Sku $sku
     }
 
     # ---- Decide recommendation with durability guardrails ----
@@ -556,7 +610,7 @@ function Get-SkuRecommendationReason {
     # Safe: RA-GRS / RA-GZRS -> GRS / GZRS (same durability, drop unused read-access uplift)
     if ($CurrentSku -in @('Standard_RAGRS','Standard_RAGZRS')) {
         $recommended = if ($CurrentSku -eq 'Standard_RAGRS') { 'Standard_GRS' } else { 'Standard_GZRS' }
-        $rationale = "This account is on $CurrentSku, which is ~25% more expensive than $recommended. The extra cost only pays for the ability to READ from the '-secondary' regional endpoint. If your application does not read from that secondary endpoint, this uplift is wasted. Switching to $recommended keeps the same durability (async replica in the paired region) and the same failover capability, but stops billing you for a read feature you're not using."
+        $rationale = "This account is on $CurrentSku, which is ~25-30% more expensive than $recommended. The extra cost only pays for the ability to READ from the '-secondary' regional endpoint. If your application does not read from that secondary endpoint, this uplift is wasted. Switching to $recommended keeps the same durability (async replica in the paired region) and the same failover capability, but stops billing you for a read feature you're not using."
         $confidence = 'safe'
     }
 
@@ -573,16 +627,16 @@ function Get-SkuRecommendationReason {
     $obs = New-Object System.Collections.Generic.List[string]
     $obs.Add(("Current replication: $CurrentSku."))
     $obs.Add(("Data stored: {0:N2} GB." -f $CapacityGB))
-    $obs.Add(("Write operations: {0:N0} per month. Geo-redundant SKUs replicate every write to the paired region, effectively doubling the write-ops line item." -f $MonthlyWrites))
+    $obs.Add(("Write operations: {0:N0} per month (plus {1:N0} list / create-container operations billed at the write rate). Geo-redundant SKUs replicate every write to the paired region, roughly doubling the write-ops line item." -f $MonthlyWrites,$MonthlyListOps))
 
     $metricsUsed = @(
         "Namespace: Microsoft.Storage/storageAccounts",
         "UsedCapacity - aggregation Average, last daily value in the observation window.",
-        "Transactions - aggregation Total, split by ApiName to separate read from write operations.",
-        "Ingress - aggregation Total, in bytes.",
+        "Transactions - aggregation Total, split by ApiName to separate read, write, list / create-container and other operations.",
+        "Ingress / Egress - aggregation Total, in bytes.",
         "SKU: read from the 'sku.name' property returned by Get-AzStorageAccount.",
         "Observation window: last $MetricsDays days.",
-        "Cost per SKU is capacity * tier price * redundancy multiplier + write ops * write price * geo-write multiplier + read ops * read price + small-blob penalty."
+        "Cost per SKU is capacity * tier price * redundancy multiplier + (write + list/create ops) * write price * geo-write multiplier + read ops * read price + other ops * flat price + data retrieval (Cool/Cold) + small-blob penalty."
     )
 
     $proj = @{}
@@ -742,6 +796,73 @@ function Get-CapacityForecast {
     }
 }
 
+function Get-StorageApiBillingClass {
+    <#
+        Maps an Azure Monitor "ApiName" dimension value to the Blob Storage billing
+        meter it is charged on (Standard general purpose v2 column of
+        https://learn.microsoft.com/azure/storage/blobs/map-rest-apis-transaction-categories):
+          Read / Write / List (list and create container, billed at the write rate) /
+          Other (flat rate) / Free (delete operations) / NonBlob (Table, Queue, File
+          service operations, which are not priced on the blob meters) / Unknown.
+        Anything that is not recognised is returned as 'Unknown' so it is never silently
+        folded into a read or write bucket.
+    #>
+    param([string] $ApiName)
+
+    if ([string]::IsNullOrWhiteSpace($ApiName)) { return 'Unknown' }
+
+    if (-not $script:ApiBillingClassMap) {
+        $map = @{}
+        $defs = [ordered]@{
+            Read  = 'GetBlob QueryBlobContents ReadFile GetFileProperties GetPathAccessControl GetPathStatus'
+            Write = 'SealBlob AppendBlockThroughCopy AppendBlock CopyBlobFromURL CopyBlob PutBlobFromURL PutBlob PutBlockFromURL PutBlockList PutBlock UndeleteBlob SetBlobTier ' +
+                    'CreateFilesystem SetFilesystemProperties CreatePathDir CreatePathFile RenamePathDir RenamePathFile AppendFile FlushFile SetFileProperties SetPathAccessControl SetPathAccessControlRecursive'
+            List  = 'CreateContainer FindBlobsByTags ListBlobs ListContainers RestoreContainer ListFilesystems ListFilesystemDir ListFilesystemFile'
+            Free  = 'DeleteBlob DeleteContainer DeleteFilesystem DeleteDirectory DeleteFile'
+            Other = 'AbortCopyBlob GetAccountInformation GetBlobMetadata GetBlobProperties GetBlobServiceProperties GetBlobServiceStats GetBlobTags GetBlockList GetContainerACL GetContainerMetadata GetContainerProperties GetUserDelegationKey ' +
+                    'IncrementalCopyBlob AcquireBlobLease ReleaseBlobLease RenewBlobLease BreakBlobLease ChangeBlobLease AcquireContainerLease ReleaseContainerLease RenewContainerLease BreakContainerLease ChangeContainerLease ' +
+                    'BlobPreflightRequest SetBlobExpiry SetBlobMetadata SetBlobProperties SetBlobServiceProperties SetBlobTags SetContainerACL SetContainerMetadata SetContainerServiceMetadata GetContainerServiceMetadata SnapshotBlob GetFilesystemProperties LeaseFile'
+        }
+        foreach ($class in $defs.Keys) {
+            foreach ($name in ($defs[$class] -split '\s+' | Where-Object { $_ })) { $map[$name] = $class }
+        }
+        $script:ApiBillingClassMap = $map
+    }
+
+    $name = $ApiName.Trim()
+    if ($script:ApiBillingClassMap.ContainsKey($name)) { return $script:ApiBillingClassMap[$name] }
+
+    # Table / Queue / File service operations (not priced on the blob meters).
+    if ($name -match 'Entit(y|ies)|Table|Queue|Message|Share|Directory|FileService|PutRange|ClearRange|GetRangeList|ListHandles|ListFiles|^GetFile$|^CreateFile$') { return 'NonBlob' }
+
+    return 'Unknown'
+}
+
+function New-UsageProfile {
+    <#
+        Converts the observed (window) operation counts into the monthly usage hashtable
+        that the cost / recommendation helpers consume via splatting.
+        Returns $null when the read/write breakdown could not be collected or validated, so
+        callers never price an account against a made-up zero.
+    #>
+    param(
+        $Metrics,
+        [int] $Days = 30
+    )
+    if (-not $Metrics -or -not $Metrics.BreakdownAvailable) { return $null }
+    # The breakdown may cover fewer days than requested (days Azure Monitor could not attribute are excluded).
+    $window = if ($Metrics.BreakdownWindowDays) { [double]$Metrics.BreakdownWindowDays } else { [double]$Days }
+    $f = 30.0 / $window
+    @{
+        MonthlyReads        = [double]$Metrics.ReadTx  * $f
+        MonthlyWrites       = [double]$Metrics.WriteTx * $f
+        MonthlyListOps      = [double]$Metrics.ListTx  * $f
+        MonthlyOtherOps     = ([double]$Metrics.OtherTx + [double]$Metrics.UnknownTx) * $f
+        MonthlyIngressBytes = [double]$Metrics.BreakdownIngressBytes * $f
+        MonthlyEgressBytes  = [double]$Metrics.BreakdownEgressBytes  * $f
+    }
+}
+
 function Get-AccountMetrics {
     param(
         [Parameter(Mandatory)] [string] $ResourceId,
@@ -784,64 +905,196 @@ function Get-AccountMetrics {
         Transactions      = 0
         ReadTx            = 0
         WriteTx           = 0
-        OtherTx           = 0
+        ListTx            = 0      # list / create container: billed at the write rate
+        OtherTx           = 0      # billed at the flat "other operations" rate
+        FreeTx            = 0      # delete operations: not billed
+        NonBlobTx         = 0      # Table / Queue / File service operations
+        UnknownTx         = 0      # ApiName values not in the classification map
+        UnknownApis       = @()
+        TopApis           = @()
         IngressBytes      = 0
         EgressBytes       = 0
         Availability      = $null
-        HasActivity       = $false
+        HasActivity       = $null
+        CapacityAvailable  = $false
+        TotalsAvailable    = $false
+        BreakdownAvailable = $false
+        BreakdownCoverage  = $null
+        BreakdownWindowDays = $null    # days actually covered by the read/write breakdown (<= requested window)
+        BreakdownIngressBytes = 0
+        BreakdownEgressBytes  = 0
+        BreakdownDaysExcluded = @()
+        Warnings           = @()
     }
+    $warnings = New-Object System.Collections.Generic.List[string]
 
-    # Call #1: Average aggregation for UsedCapacity (daily series) + Availability.
+    # Call #1: Average aggregation for UsedCapacity (daily series).
     try {
-        $avgSet = & $invoke @{ MetricName = @('UsedCapacity','Availability'); AggregationType = 'Average' }
-        foreach ($m in $avgSet) {
+        $capSet = & $invoke @{ MetricName = 'UsedCapacity'; AggregationType = 'Average' }
+        foreach ($m in @($capSet)) {
             $vals = $m.Data | Where-Object { $null -ne $_.Average }
-            switch ($m.Name.Value) {
-                'UsedCapacity' {
-                    if ($vals) {
-                        $out.UsedCapacityBytes   = ($vals | Select-Object -Last 1).Average
-                        $out.UsedCapacityDailyGB = @($vals | ForEach-Object { [math]::Round($_.Average / 1GB, 3) })
-                    }
-                }
-                'Availability' {
-                    if ($vals) { $out.Availability = [math]::Round((($vals | Measure-Object Average -Average).Average), 3) }
-                }
+            if ($vals) {
+                $out.UsedCapacityBytes   = ($vals | Select-Object -Last 1).Average
+                $out.UsedCapacityDailyGB = @($vals | ForEach-Object { [math]::Round($_.Average / 1GB, 3) })
+                $out.CapacityAvailable   = $true
             }
         }
-    } catch { Write-Verbose ("Metric(avg) error on {0}: {1}" -f $ResourceId, $_.Exception.Message) }
+        if (-not $out.CapacityAvailable) { $warnings.Add('UsedCapacity returned no data points.') }
+    } catch { $warnings.Add("UsedCapacity query failed: $($_.Exception.Message)") }
+
+    # Availability is queried on its own so a failure here can never discard capacity data.
+    try {
+        $avSet = & $invoke @{ MetricName = 'Availability'; AggregationType = 'Average' }
+        foreach ($m in @($avSet)) {
+            $vals = $m.Data | Where-Object { $null -ne $_.Average }
+            if ($vals) { $out.Availability = [math]::Round((($vals | Measure-Object Average -Average).Average), 3) }
+        }
+    } catch { Write-Verbose ("Metric(availability) error on {0}: {1}" -f $ResourceId, $_.Exception.Message) }
+
+    # Per-day accumulators. Totals and the ApiName split are reconciled day by day because Azure Monitor
+    # occasionally holds transactions for a day that carry no ApiName value (seen on real accounts).
+    $dayKeyOf = {
+        param($point, $index)
+        if ($point.TimeStamp) {
+            $t = [datetime]$point.TimeStamp
+            if ($t.Kind -eq 'Local') { $t = $t.ToUniversalTime() }
+            $t.ToString('yyyy-MM-dd')
+        } else { 'i{0:D4}' -f $index }
+    }
+    $dayTx = @{}; $dayIn = @{}; $dayEg = @{}
+    $daySplit = @{}      # day -> @{ Read; Write; List; Other; Free; NonBlob; Unknown; Unmapped; Total }
+    $dayApi   = @{}      # day -> @{ ApiName -> count }
 
     # Call #2: Total aggregation for Transactions + Ingress + Egress in a single batched call.
     try {
         $totSet = & $invoke @{ MetricName = @('Transactions','Ingress','Egress'); AggregationType = 'Total' }
-        foreach ($m in $totSet) {
-            $sum = ($m.Data | Measure-Object Total -Sum).Sum
-            if ($null -eq $sum) { continue }
-            switch ($m.Name.Value) {
-                'Transactions' { $out.Transactions = [int64] $sum }
-                'Ingress'      { $out.IngressBytes = [int64] $sum }
-                'Egress'       { $out.EgressBytes  = [int64] $sum }
+        $seen = @{}
+        foreach ($m in @($totSet)) {
+            $name = $m.Name.Value
+            $seen[$name] = $true
+            $i = 0
+            foreach ($d in @($m.Data)) {
+                if ($null -ne $d.Total) {
+                    $k = & $dayKeyOf $d $i
+                    switch ($name) {
+                        'Transactions' { $dayTx[$k] = [double]$dayTx[$k] + $d.Total }
+                        'Ingress'      { $dayIn[$k] = [double]$dayIn[$k] + $d.Total }
+                        'Egress'       { $dayEg[$k] = [double]$dayEg[$k] + $d.Total }
+                    }
+                }
+                $i++
             }
         }
-    } catch { Write-Verbose ("Metric(total) error on {0}: {1}" -f $ResourceId, $_.Exception.Message) }
+        $out.Transactions = [int64](($dayTx.Values | Measure-Object -Sum).Sum)
+        $out.IngressBytes = [int64](($dayIn.Values | Measure-Object -Sum).Sum)
+        $out.EgressBytes  = [int64](($dayEg.Values | Measure-Object -Sum).Sum)
+        $out.TotalsAvailable = $seen.ContainsKey('Transactions') -and $seen.ContainsKey('Ingress') -and $seen.ContainsKey('Egress')
+        if (-not $out.TotalsAvailable) { $warnings.Add('Transactions / Ingress / Egress totals were not all returned by Azure Monitor.') }
+    } catch { $warnings.Add("Transactions / Ingress / Egress query failed: $($_.Exception.Message)") }
 
-    # Call #3: Transactions split by ApiName dimension to derive read/write mix.
+    # Call #3: Transactions split by ApiName dimension to derive the read / write / other mix.
+    $splitOk = $false
     try {
-        $split = & $invoke @{ MetricName = 'Transactions'; AggregationType = 'Total'; MetricFilter = "ApiName eq '*'" }
-        foreach ($ts in $split.Timeseries) {
-            $api = ($ts.Metadatavalues | Where-Object Name -Match 'ApiName').Value
-            $sum = ($ts.Data | Measure-Object Total -Sum).Sum
-            if ($null -eq $sum) { continue }
-            if ($api -match '^(GetBlob|ReadFile|ListBlobs|GetBlobProperties|GetBlobMetadata|GetContainerProperties|GetContainerACL|GetTableEntity|QueryEntities|QueryTable|GetMessage|PeekMessage)') {
-                $out.ReadTx += [int64] $sum
-            } elseif ($api -match '^(PutBlob|PutBlock|PutBlockList|SetBlobProperties|SetBlobMetadata|SetBlobTier|WriteFile|CreateFile|SetFileProperties|InsertEntity|UpdateEntity|MergeEntity|InsertOrMergeEntity|InsertOrReplaceEntity|PutMessage|SetQueueACL|CreateContainer|SetContainerACL|SetContainerMetadata)') {
-                $out.WriteTx += [int64] $sum
-            } else {
-                $out.OtherTx += [int64] $sum
+        # Azure Monitor returns only 10 dimension series unless -Top is raised; accounts routinely use more than 10 distinct APIs.
+        $split = & $invoke @{ MetricName = 'Transactions'; AggregationType = 'Total'; MetricFilter = "ApiName eq '*'"; Top = 1000 }
+        foreach ($metric in @($split)) {
+            foreach ($ts in @($metric.Timeseries)) {
+                # Metadatavalues[].Name is a LocalizableString object; the dimension name is in .Value.
+                $api = $null
+                foreach ($mv in @($ts.Metadatavalues)) {
+                    $dimName = if ($mv.Name -is [string]) { $mv.Name } else { $mv.Name.Value }
+                    if ($dimName -eq 'ApiName') { $api = [string]$mv.Value; break }
+                }
+                $key   = if ($api) { $api } else { '(no ApiName)' }
+                $class = Get-StorageApiBillingClass $api
+                $i = 0
+                foreach ($d in @($ts.Data)) {
+                    if ($null -ne $d.Total -and $d.Total -gt 0) {
+                        $k = & $dayKeyOf $d $i
+                        if (-not $daySplit.ContainsKey($k)) { $daySplit[$k] = @{ Read = 0.0; Write = 0.0; List = 0.0; Other = 0.0; Free = 0.0; NonBlob = 0.0; Unknown = 0.0; Unmapped = 0.0; Total = 0.0 }; $dayApi[$k] = @{} }
+                        $daySplit[$k].Total += $d.Total
+                        $daySplit[$k][$class] += $d.Total
+                        # Azure reports a literal 'Unknown' ApiName for requests it could not attribute; only truly unmapped names count toward the warning.
+                        if ($class -eq 'Unknown' -and $key -ne 'Unknown' -and $key -ne '(no ApiName)') { $daySplit[$k].Unmapped += $d.Total }
+                        $dayApi[$k][$key] = [double]$dayApi[$k][$key] + $d.Total
+                    }
+                    $i++
+                }
             }
         }
-    } catch { }
+        $splitOk = $true
+    } catch { $warnings.Add("Transactions by ApiName query failed: $($_.Exception.Message)") }
 
-    $out.HasActivity = ($out.Transactions -gt 0) -or (($out.IngressBytes + $out.EgressBytes) -gt 0)
+    # Reconcile day by day and keep the longest most-recent run of days whose split matches the total.
+    $unmappedTx = [int64]0
+    if ($splitOk -and $out.TotalsAvailable) {
+        $allDays = @(@($dayTx.Keys) + @($daySplit.Keys) | Sort-Object -Unique)
+        $n = $allDays.Count
+        $minDays = [math]::Min(7, [math]::Max(1, $n))
+        $chosen = -1; $chosenCov = $null
+        for ($s = 0; $s -le ($n - $minDays); $s++) {
+            $t = 0.0; $p = 0.0
+            for ($j = $s; $j -lt $n; $j++) { $t += [double]$dayTx[$allDays[$j]]; if ($daySplit.ContainsKey($allDays[$j])) { $p += $daySplit[$allDays[$j]].Total } }
+            $cov = if ($t -gt 0) { $p / $t } elseif ($p -eq 0) { 1.0 } else { [double]::PositiveInfinity }
+            if ($cov -ge 0.95 -and $cov -le 1.05) { $chosen = $s; $chosenCov = $cov; break }
+        }
+        if ($n -eq 0) {
+            $out.BreakdownCoverage = 1.0; $out.BreakdownAvailable = $true; $out.BreakdownWindowDays = [double]$Days
+        } elseif ($chosen -ge 0) {
+            $used = @($allDays[$chosen..($n - 1)])
+            $sum = @{ Read = 0.0; Write = 0.0; List = 0.0; Other = 0.0; Free = 0.0; NonBlob = 0.0; Unknown = 0.0; Unmapped = 0.0; Total = 0.0 }
+            $apiTot = @{}; $inB = 0.0; $egB = 0.0; $txU = 0.0
+            foreach ($k in $used) {
+                $txU += [double]$dayTx[$k]; $inB += [double]$dayIn[$k]; $egB += [double]$dayEg[$k]
+                if ($daySplit.ContainsKey($k)) {
+                    foreach ($c in @($sum.Keys)) { $sum[$c] += $daySplit[$k][$c] }
+                    foreach ($a in $dayApi[$k].Keys) { $apiTot[$a] = [double]$apiTot[$a] + $dayApi[$k][$a] }
+                }
+            }
+            $out.ReadTx = [int64]$sum.Read; $out.WriteTx = [int64]$sum.Write; $out.ListTx = [int64]$sum.List
+            $out.OtherTx = [int64]$sum.Other; $out.FreeTx = [int64]$sum.Free; $out.NonBlobTx = [int64]$sum.NonBlob; $out.UnknownTx = [int64]$sum.Unknown
+            $unmappedTx = [int64]$sum.Unmapped
+            $out.BreakdownIngressBytes = [int64]$inB; $out.BreakdownEgressBytes = [int64]$egB
+            $out.BreakdownCoverage = [math]::Round($chosenCov, 4)
+            $out.BreakdownAvailable = $true
+            $sorted = @($apiTot.GetEnumerator() | Sort-Object Value -Descending)
+            $out.TopApis     = @($sorted | Select-Object -First 8 | ForEach-Object { '{0}={1}' -f $_.Key, [int64]$_.Value })
+            $out.UnknownApis = @($sorted | Where-Object { (Get-StorageApiBillingClass $_.Key) -eq 'Unknown' } | Select-Object -First 8 | ForEach-Object { '{0}={1}' -f $_.Key, [int64]$_.Value })
+
+            # Real duration covered by the chosen days (the first bucket may be partial).
+            $first = [datetime]::MinValue
+            $windowDays = if ([datetime]::TryParseExact($used[0], 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$first)) {
+                ($end - $(if ($first -gt $start) { $first } else { $start })).TotalDays
+            } else { [double]$Days * $used.Count / $n }
+            $out.BreakdownWindowDays = [math]::Max(0.5, [double]$windowDays)
+
+            if ($chosen -gt 0) {
+                $skipped = @($allDays[0..($chosen - 1)])
+                $out.BreakdownDaysExcluded = $skipped
+                $lostTx = 0.0; foreach ($k in $skipped) { $lostTx += [double]$dayTx[$k] - $(if ($daySplit.ContainsKey($k)) { $daySplit[$k].Total } else { 0 }) }
+                $warnings.Add(("Azure Monitor holds transactions on {0} earlier day(s) ({1}) that are not attributed to any ApiName (~{2:N0} transactions). The read/write breakdown, and the cost projections built on it, use the most recent {3:N1} days that reconcile instead of {4}." -f $skipped.Count, ($skipped -join ', '), $lostTx, $out.BreakdownWindowDays, $Days))
+            }
+        } else {
+            $p = 0.0; foreach ($k in $daySplit.Keys) { $p += $daySplit[$k].Total }
+            $out.BreakdownCoverage = if ($out.Transactions -gt 0) { [math]::Round($p / [double]$out.Transactions, 4) } else { $null }
+            $warnings.Add(("ApiName breakdown does not reconcile with the {0:N0} total transactions (coverage {1:P1}) on any recent window of at least {2} day(s); read/write figures were withheld." -f $out.Transactions, $out.BreakdownCoverage, $minDays))
+        }
+    } elseif ($splitOk -and -not $out.TotalsAvailable) {
+        $warnings.Add('ApiName breakdown could not be validated because the transaction total is unavailable.')
+    }
+
+    if ($out.BreakdownAvailable -and $unmappedTx -gt 0) {
+        $inWindow = $out.ReadTx + $out.WriteTx + $out.ListTx + $out.OtherTx + $out.FreeTx + $out.NonBlobTx + $out.UnknownTx
+        $unkShare = if ($inWindow -gt 0) { $unmappedTx / [double]$inWindow } else { 0 }
+        if ($unkShare -ge 0.05) {
+            $warnings.Add(("{0:P1} of transactions use ApiName values that are not in the classification map ({1}); they are priced as 'other operations'." -f $unkShare, (@($out.UnknownApis | Where-Object { $_ -notmatch '^(Unknown|\(no ApiName\))=' }) -join ', ')))
+        }
+    }
+
+    if ($out.TotalsAvailable) {
+        $out.HasActivity = ($out.Transactions -gt 0) -or (($out.IngressBytes + $out.EgressBytes) -gt 0)
+    }
+    $out.Warnings = @($warnings)
     return $out
 }
 
@@ -880,8 +1133,8 @@ function Invoke-StorageAccountAnalysis {
     param(
         [Parameter(Mandatory)] $Graph,   # ResourceGraph row
         [Parameter(Mandatory)] $SaObj,   # full SA object from Get-AzStorageAccount
-        [Parameter(Mandatory)] $Blob,    # blob service properties (may be $null)
-        $Metrics                          # metrics hash (may be $null)
+        [AllowNull()] $Blob,             # blob service properties (may be $null, e.g. Premium FileStorage)
+        [AllowNull()] $Metrics           # metrics hash (may be $null)
     )
 
     $findings = New-Object System.Collections.Generic.List[object]
@@ -894,46 +1147,66 @@ function Invoke-StorageAccountAnalysis {
     if ($Metrics -and $Metrics.UsedCapacityBytes) { $capBytes = [double]$Metrics.UsedCapacityBytes }
     $capGB = [math]::Round($capBytes / 1GB, 2)
 
-    $txTotal = if ($Metrics) { [int64]$Metrics.Transactions } else { 0 }
-    $txRead  = if ($Metrics) { [int64]$Metrics.ReadTx }       else { 0 }
-    $txWrite = if ($Metrics) { [int64]$Metrics.WriteTx }      else { 0 }
+    $txKnown = [bool]($Metrics -and $Metrics.TotalsAvailable)
+    $txTotal = if ($txKnown) { [int64]$Metrics.Transactions } else { 0 }
 
     # Monthly extrapolation factor
     $factor  = 30.0 / [double]$MetricsDays
     $mTx     = $txTotal * $factor
-    $mRead   = $txRead  * $factor
-    $mWrite  = $txWrite * $factor
-    $mIngBytes = if ($Metrics) { [double]$Metrics.IngressBytes * $factor } else { 0 }
+
+    # Read / write / other mix. $usage is $null whenever the ApiName breakdown could not be
+    # collected or did not reconcile with the total, and in that case nothing is priced.
+    $usage   = New-UsageProfile -Metrics $Metrics -Days $MetricsDays
+    $mRead   = if ($usage) { $usage.MonthlyReads }   else { 0 }
+    $mWrite  = if ($usage) { $usage.MonthlyWrites }  else { 0 }
+    $mList   = if ($usage) { $usage.MonthlyListOps } else { 0 }
+
+    # ---- 0. Metrics data quality --------------------------------------------
+    # Surfaces collection problems instead of letting them turn into zeros.
+    if (-not $SkipMetrics -and $Metrics -and $Metrics.Warnings -and @($Metrics.Warnings).Count -gt 0) {
+        $dqSev = if (-not $Metrics.BreakdownAvailable -or -not $Metrics.TotalsAvailable -or -not $Metrics.CapacityAvailable) { 'Medium' } else { 'Low' }
+        $findings.Add((New-Finding `
+            -Pillar 'Cost' -Category 'Data Quality' -Severity $dqSev `
+            -Title "Azure Monitor metrics are incomplete for this account - usage-based figures withheld or approximate" `
+            -Description ("The optimizer could not fully collect or validate the metrics for this account:`n  - {0}`n`n{1}" -f (@($Metrics.Warnings) -join "`n  - "), $(if ($Metrics.BreakdownAvailable) { "The read / write breakdown was validated against Azure Monitor totals (see the note above for the window it covers), so tier and replication projections were produced from it." } else { "Where the read / write breakdown is unavailable the report shows 'n/a' instead of zero, and the tier / replication cost projections are not produced for the account. Idle-account findings are also suppressed when the transaction totals are unavailable." })) `
+            -Recommendation "Re-run the optimizer. If the warning persists, confirm the principal has Monitoring Reader on the account and compare with the portal (Monitoring > Metrics > Transactions, split by API name) over the same window." `
+            -Impact $(if ($Metrics.BreakdownAvailable) { "Figures derived from the read / write breakdown reflect the validated window only; treat them as approximate." } else { "Without a validated operation mix the transaction cost of each tier cannot be estimated, so no tier or replication saving is claimed for this account." }) `
+            -Evidence ("TotalsAvailable={0} | BreakdownAvailable={1} | CapacityAvailable={2} | Coverage={3} | TopApis=[{4}]" -f $Metrics.TotalsAvailable,$Metrics.BreakdownAvailable,$Metrics.CapacityAvailable,$Metrics.BreakdownCoverage,(@($Metrics.TopApis) -join ', ')) `
+            -VerifyCommand ("az monitor metrics list --resource {0} --metric Transactions --dimension ApiName --aggregation Total --interval P1D" -f $SaObj.Id)))
+    }
 
     # ---- 1. GPv1 pre-migration guidance -------------------------------------
     # Not a Modernization audit finding — this is a Cost warning for the customer
     # BEFORE they upgrade to GPv2 (the BOLD scenario: GPv1 -> GPv2 default Cool tier
     # + high tx + geo redundancy multiplied costs 100x+).
     if ($kind -in @('Storage','BlobStorage')) {
+        $loadText = if ($usage) { "~{0:N0} tx ({1:N0} reads + {2:N0} writes + {3:N0} list/create-container ops)" -f $mTx,$mRead,$mWrite,$mList }
+                    elseif ($txKnown) { "~{0:N0} tx (read/write breakdown unavailable)" -f $mTx }
+                    else { "transaction metrics unavailable" }
         $findings.Add((New-Finding `
             -Pillar 'Cost' -Category 'GPv1 Pre-Migration' -Severity 'High' `
             -Title "Account is still GPv1 (kind=$kind) — validate tier & redundancy BEFORE upgrading" `
-            -Description ("This account uses the legacy GPv1 pricing model. GPv2 uses tier-based per-transaction pricing that is 2-5x higher than GPv1 for Cool/Cold tiers. If GPv2 is enabled with an access tier that does not match the workload's read/write pattern, the monthly bill can jump by 10x-150x (real customer case). Observed monthly load: ~{0:N0} tx ({1:N0} reads + {2:N0} writes), capacity {3:N2} GB, SKU={4}." -f $mTx,$mRead,$mWrite,$capGB,$sku) `
+            -Description ("This account uses the legacy GPv1 pricing model. GPv2 uses tier-based per-transaction pricing that is 2-5x higher than GPv1 for Cool/Cold tiers. If GPv2 is enabled with an access tier that does not match the workload's read/write pattern, the monthly bill can jump by 10x-150x (real customer case). Observed monthly load: {0}, capacity {1:N2} GB, SKU={2}." -f $loadText,$capGB,$sku) `
             -Recommendation "Before enabling GPv2: (1) confirm the correct access tier for the actual workload using the 'Tier optimization' finding for this account; (2) if writes/reads are high-frequency, keep Hot tier at all cost — do NOT accept the GPv2 default; (3) if SKU is geo-redundant (GRS/RA-GRS/GZRS/RA-GZRS), remember every WRITE op is also billed for the secondary region; (4) run this optimizer BEFORE and AFTER migration and compare." `
             -Impact "GPv1 -> GPv2 with the wrong tier is the #1 cause of unexpected storage bill spikes in the field." `
-            -Evidence ("Kind=$kind | SKU=$sku | Tier=$tier | Tx/mo={0:N0} | Cap={1:N2} GB" -f $mTx,$capGB) `
+            -Evidence ("Kind=$kind | SKU=$sku | Tier=$tier | Tx/mo={0} | Cap={1:N2} GB" -f $(if ($txKnown) { '{0:N0}' -f $mTx } else { 'n/a' }),$capGB) `
             -VerifyCommand ("az storage account show -n {0} -g {1} --query 'kind'" -f $SaObj.StorageAccountName,$SaObj.ResourceGroupName)))
     }
 
     # ---- 2. Tier optimization based on observed cost math -------------------
     # For GPv2 accounts: compute what the monthly cost WOULD be at Hot / Cool / Cold
-    # using the ACTUAL observed read+write+capacity, then recommend the tier with the
+    # using the ACTUAL observed operation mix + capacity, then recommend the tier with the
     # lowest total. This is what turns a generic "wrong tier" alert into a defensible,
-    # numeric recommendation.
-    if (-not $SkipMetrics -and $Metrics -and $kind -eq 'StorageV2' -and $capGB -ge 0.01) {
-        $hot  = Get-TierCostBreakdown -Tier Hot  -CapacityGB $capGB -MonthlyReads $mRead -MonthlyWrites $mWrite -MonthlyIngressBytes $mIngBytes -Sku $sku
-        $cool = Get-TierCostBreakdown -Tier Cool -CapacityGB $capGB -MonthlyReads $mRead -MonthlyWrites $mWrite -MonthlyIngressBytes $mIngBytes -Sku $sku
-        $cold = Get-TierCostBreakdown -Tier Cold -CapacityGB $capGB -MonthlyReads $mRead -MonthlyWrites $mWrite -MonthlyIngressBytes $mIngBytes -Sku $sku
+    # numeric recommendation. Skipped when the operation mix is unavailable.
+    if (-not $SkipMetrics -and $usage -and $kind -eq 'StorageV2' -and $capGB -ge 0.01) {
+        $hot  = Get-TierCostBreakdown -Tier Hot  -CapacityGB $capGB -Sku $sku @usage
+        $cool = Get-TierCostBreakdown -Tier Cool -CapacityGB $capGB -Sku $sku @usage
+        $cold = Get-TierCostBreakdown -Tier Cold -CapacityGB $capGB -Sku $sku @usage
         $projections = @($hot,$cool,$cold)
         $cheapest = $projections | Sort-Object TotalCost | Select-Object -First 1
         $current  = switch ($tier) { 'Hot' { $hot } 'Cool' { $cool } 'Cold' { $cold } default { $hot } }
         $delta    = [math]::Round($current.TotalCost - $cheapest.TotalCost, 2)
-        $reasonInfo = Get-TierRecommendationReason -Projections $projections -CurrentTier $tier -MonthlyReads $mRead -MonthlyWrites $mWrite -CapacityGB $capGB -MetricsDays $MetricsDays
+        $reasonInfo = Get-TierRecommendationReason -Projections $projections -CurrentTier $tier -CapacityGB $capGB -MetricsDays $MetricsDays @usage
 
         # Always fire a finding when the recommendation differs from the current tier,
         # regardless of $ savings magnitude. This way the "Recommended: → X" badge in
@@ -942,7 +1215,7 @@ function Invoke-StorageAccountAnalysis {
             $sev = if ($delta -ge 50) { 'Critical' } elseif ($delta -ge 10) { 'High' } elseif ($delta -ge 3) { 'Medium' } elseif ($delta -ge 0.5) { 'Low' } else { 'Informational' }
             $sizeNote = ''
             if ($current.AvgBlobSizeKB -and $current.AvgBlobSizeKB -lt 128 -and $tier -in @('Cool','Cold')) {
-                $sizeNote = (" | Avg written blob ~{0:N1} KB (< 128 KB, triggers minimum-billable-blob penalty of \${1:N2}/mo)" -f $current.AvgBlobSizeKB,$current.SmallWritePenalty)
+                $sizeNote = (" | Avg written blob ~{0:N1} KB (< 128 KB, triggers minimum-billable-blob penalty of `${1:N2}/mo)" -f $current.AvgBlobSizeKB,$current.SmallWritePenalty)
             }
 
             # Structured, sectioned description so the customer sees "where the numbers come from"
@@ -955,16 +1228,16 @@ function Invoke-StorageAccountAnalysis {
             $null = $descBuilder.AppendLine('')
             $null = $descBuilder.AppendLine("Why this matters. $($reasonInfo.Interpretation)")
             $null = $descBuilder.AppendLine('')
-            $null = $descBuilder.AppendLine(('Cost projection at your usage (capacity + read ops + write ops + Cool/Cold small-blob penalty): Hot=${0:N2} | Cool=${1:N2} | Cold=${2:N2}.' -f $hot.TotalCost,$cool.TotalCost,$cold.TotalCost))
+            $null = $descBuilder.AppendLine(('Cost projection at your usage (capacity + read / write / other ops + Cool/Cold data retrieval + small-blob penalty): Hot=${0:N2} | Cool=${1:N2} | Cold=${2:N2}.' -f $hot.TotalCost,$cool.TotalCost,$cold.TotalCost))
             $description = $descBuilder.ToString()
 
             $findings.Add((New-Finding `
                 -Pillar 'Cost' -Category 'Tier Optimization' -Severity $sev `
-                -Title ("Tier '$tier' is not the cheapest for this workload — recommend '{0}' (save ~\${1:N2}/mo)" -f $cheapest.Tier,$delta) `
+                -Title ("Tier '$tier' is not the cheapest for this workload — recommend '{0}' (save ~`${1:N2}/mo)" -f $cheapest.Tier,$delta) `
                 -Description $description `
                 -Recommendation ($reasonInfo.Action) `
                 -Impact "Access-tier mismatch is the #1 driver of Storage bill anomalies after GPv1->GPv2 migrations. The mismatch multiplies every future read and write." `
-                -Evidence ("Current tier=$tier | Cap={0:N2} GB | Reads/mo={1:N0} | Writes/mo={2:N0} | SKU=$sku | Hot=\${3:N2} Cool=\${4:N2} Cold=\${5:N2}{6}" -f $capGB,$mRead,$mWrite,$hot.TotalCost,$cool.TotalCost,$cold.TotalCost,$sizeNote) `
+                -Evidence ("Current tier=$tier | Cap={0:N2} GB | Reads/mo={1:N0} | Writes/mo={2:N0} | List+create/mo={3:N0} | Other/mo={4:N0} | Egress GB/mo={5:N2} | SKU=$sku | Hot=`${6:N2} Cool=`${7:N2} Cold=`${8:N2}{9}" -f $capGB,$mRead,$mWrite,$mList,$usage.MonthlyOtherOps,($usage.MonthlyEgressBytes/1GB),$hot.TotalCost,$cool.TotalCost,$cold.TotalCost,$sizeNote) `
                 -EstimatedMonthlySavingsUsd $delta `
                 -VerifyCommand ("az storage account show -n {0} -g {1} --query 'accessTier'" -f $SaObj.StorageAccountName,$SaObj.ResourceGroupName) `
                 -RemediationGroupKey ("tier:{0}->{1}" -f $tier,$cheapest.Tier) `
@@ -978,11 +1251,11 @@ function Invoke-StorageAccountAnalysis {
             $findings.Add((New-Finding `
                 -Pillar 'Cost' -Category 'Small-Blob Penalty' -Severity 'High' `
                 -Title ("Small-blob writes on '$tier' tier are billed against a 128 KB minimum") `
-                -Description ("Every PUT/write of a blob smaller than 128 KB is billed for CAPACITY as if it were 128 KB in the Cool and Cold tiers. Estimated average written blob size is {0:N1} KB, which inflates monthly capacity billing by approximately \${1:N2}." -f $current.AvgBlobSizeKB,$current.SmallWritePenalty) `
+                -Description ("Every PUT/write of a blob smaller than 128 KB is billed for CAPACITY as if it were 128 KB in the Cool and Cold tiers. Estimated average written blob size is {0:N1} KB, which inflates monthly capacity billing by approximately `${1:N2}. This amount is already part of the Cool/Cold cost projection (and of the Tier Optimization saving when that finding fires), so it is not added to the savings total again." -f $current.AvgBlobSizeKB,$current.SmallWritePenalty) `
                 -Recommendation "Either (1) move the account back to Hot tier (no minimum-blob penalty), or (2) batch the small writes into larger objects (e.g., append blobs, batching to >=128 KB per PUT), or (3) route the small-object workload to a separate Hot-tier account and keep only the large archived objects in Cool/Cold." `
                 -Impact "This penalty is invisible in the portal's default cost views and is the hidden multiplier behind many GPv1->GPv2 Cool-tier bill spikes." `
-                -Evidence ("Tier=$tier | Writes/mo={0:N0} | Avg blob size~{1:N1} KB | Min billable=128 KB | Extra capacity cost~\${2:N2}/mo" -f $mWrite,$current.AvgBlobSizeKB,$current.SmallWritePenalty) `
-                -EstimatedMonthlySavingsUsd $current.SmallWritePenalty `
+                -Evidence ("Tier=$tier | Writes/mo={0:N0} | Avg blob size~{1:N1} KB | Min billable=128 KB | Extra capacity cost~`${2:N2}/mo" -f $mWrite,$current.AvgBlobSizeKB,$current.SmallWritePenalty) `
+                -EstimatedMonthlySavingsUsd 0 `
                 -VerifyCommand ("az monitor metrics list --resource {0} --metric Transactions Ingress --interval PT1H" -f $SaObj.Id) `
                 -RemediationGroupKey ("tier:{0}->Hot" -f $tier) `
                 -RemediationScript (("# Small-blob penalty on '{2}' tier. Either move the account to Hot OR add lifecycle to batch small writes.`n# Option 1 (simplest): revert to Hot tier.`naz storage account update -n {0} -g {1} --access-tier Hot") -f $SaObj.StorageAccountName,$SaObj.ResourceGroupName,$tier)))
@@ -990,37 +1263,47 @@ function Invoke-StorageAccountAnalysis {
     }
 
     # ---- 3. Redundancy vs. real usage ---------------------------------------
-    if ($sku -like '*GRS*' -or $sku -eq 'Standard_RAGRS' -or $sku -eq 'Standard_RAGZRS') {
+    if ($sku -match '^Standard_(RA)?G(Z)?RS$') {
         # Estimate the transactional overhead: geo-redundant SKUs replicate every write,
         # so each write op is billed against BOTH regions (~2x).
         $writePrice   = switch ($tier) { 'Hot' { $script:Pricing.TxWrite_Hot } 'Cool' { $script:Pricing.TxWrite_Cool } 'Cold' { $script:Pricing.TxWrite_Cold } default { $script:Pricing.TxWrite_Hot } }
-        $geoWriteExtra = ($mWrite / 10000.0) * $writePrice  # the extra region-billed write cost
-        if (-not $SkipMetrics -and $Metrics -and $capGB -ge 1) {
+        $geoMult      = if ($script:Pricing.GeoWriteMultiplier[$sku]) { $script:Pricing.GeoWriteMultiplier[$sku] } else { 2.0 }
+        # $null when the read/write breakdown is unavailable: the surcharge is then reported as not quantified, never as $0.
+        $geoWriteExtra = if ($usage) { (($mWrite + $mList) / 10000.0) * $writePrice * ($geoMult - 1) } else { $null }
+        $geoWriteUsd   = if ($null -ne $geoWriteExtra) { $geoWriteExtra } else { 0 }
+        $geoTxText     = if ($null -ne $geoWriteExtra) {
+            "~`${0:N2}/mo in geo-write transaction charges at the observed write rate ({1:N0} writes and {2:N0} list/create-container operations per month)" -f $geoWriteExtra,$mWrite,$mList
+        } else { "a geo-write transaction surcharge that could not be quantified (read/write breakdown unavailable)" }
+        $geoEvidence   = if ($null -ne $geoWriteExtra) { "Writes/mo={0:N0} | Extra geo-write≈`${1:N2}/mo" -f $mWrite,$geoWriteExtra } else { 'Writes/mo=n/a | Extra geo-write=n/a' }
+        if (-not $SkipMetrics -and $Metrics -and $Metrics.CapacityAvailable -and $capGB -ge 1) {
             $baseCap = $capGB * (Get-TierCapacityPrice $tier)
             $mult    = $script:Pricing.RedundancyMultiplier[$sku]
             if (-not $mult) { $mult = 2.0 }
             $extra   = $baseCap * ($mult - 1)
             if ($sku -in @('Standard_RAGRS','Standard_RAGZRS')) {
+                $raTarget  = $sku -replace 'RAG','G'
+                $raTgtMult = $script:Pricing.RedundancyMultiplier[$raTarget]
+                $raSavings = if ($raTgtMult) { $baseCap * ($mult - $raTgtMult) } else { 0 }
                 $findings.Add((New-Finding `
                     -Pillar 'Cost' -Category 'Redundancy' -Severity 'Medium' `
                     -Title "Read-access geo-redundancy ($sku) — verify secondary reads are actually used" `
-                    -Description ("RA-GRS / RA-GZRS costs ~25% more than GRS/GZRS. If the application never reads from the '-secondary' endpoint, that read-access uplift is wasted. Additionally, every write operation is billed against the secondary region, adding ~\${0:N2}/mo in geo-write transaction charges at the observed write rate ({1:N0} writes/month)." -f $geoWriteExtra,$mWrite) `
-                    -Recommendation "If no consumer reads from the '-secondary' endpoint, switch to GRS (or GZRS) to remove the read-access uplift. For write-heavy workloads without a strict cross-region DR requirement, consider ZRS (zonal, ~25% uplift over LRS) instead of GRS (~100% uplift + geo-write ops)." `
+                    -Description ("RA-GRS / RA-GZRS costs ~25-30% more than GRS/GZRS. If the application never reads from the '-secondary' endpoint, that read-access uplift is wasted. Additionally, every write operation is billed against the secondary region, adding {0}." -f $geoTxText) `
+                    -Recommendation "If no consumer reads from the '-secondary' endpoint, switch to GRS (or GZRS) to remove the read-access uplift. For write-heavy workloads without a strict cross-region DR requirement, consider ZRS (zonal, ~25% uplift over LRS) instead of GRS (~2x capacity uplift + geo-write ops)." `
                     -Impact "Read-access uplift is billed even when the secondary endpoint is never contacted. Geo-write ops charge is invisible in the portal's default cost split." `
-                    -Evidence ("SKU=$sku | Capacity={0:N2} GB | Writes/mo={1:N0} | Extra geo-write cost≈\${2:N2}/mo" -f $capGB,$mWrite,$geoWriteExtra) `
-                    -EstimatedMonthlySavingsUsd ($baseCap * 0.25) `
+                    -Evidence ("SKU=$sku | Capacity={0:N2} GB | {1}" -f $capGB,$geoEvidence) `
+                    -EstimatedMonthlySavingsUsd $raSavings `
                     -VerifyCommand ("az storage account show -n {0} -g {1} --query 'sku.name'" -f $SaObj.StorageAccountName,$SaObj.ResourceGroupName) `
-                    -RemediationGroupKey ("sku:{0}->{1}" -f $sku,($sku -replace 'RAG','G')) `
-                    -RemediationScript (("az storage account update -n {0} -g {1} --sku {2}") -f $SaObj.StorageAccountName,$SaObj.ResourceGroupName,($sku -replace 'RAG','G'))))
+                    -RemediationGroupKey ("sku:{0}->{1}" -f $sku,$raTarget) `
+                    -RemediationScript (("az storage account update -n {0} -g {1} --sku {2}") -f $SaObj.StorageAccountName,$SaObj.ResourceGroupName,$raTarget)))
             } else {
                 $findings.Add((New-Finding `
                     -Pillar 'Cost' -Category 'Redundancy' -Severity 'Low' `
                     -Title "Geo-redundant SKU ($sku) — confirm DR requirement" `
-                    -Description ("GRS/GZRS doubles capacity cost vs. LRS/ZRS AND doubles write-transaction cost (every write is replicated to the secondary region). At the observed write rate ({0:N0} writes/month) that is ~\${1:N2}/mo in extra transaction charges alone, on top of ~\${2:N2}/mo in extra capacity charges." -f $mWrite,$geoWriteExtra,$extra) `
+                    -Description ("GRS/GZRS roughly doubles capacity cost vs. LRS AND roughly doubles write-transaction cost (every write is replicated to the secondary region). On this account that is {0}, on top of ~`${1:N2}/mo in extra capacity charges." -f $geoTxText,$extra) `
                     -Recommendation "Only keep GRS/GZRS if the workload has a real cross-region DR/RPO requirement. For non-critical workloads (dev/test, logs, cache, ephemeral data), use LRS or ZRS. For zonal HA without cross-region cost, use ZRS." `
                     -Impact "Geo-redundancy roughly doubles both the capacity AND the write-transaction bill." `
-                    -Evidence ("SKU=$sku | Capacity={0:N2} GB | Writes/mo={1:N0} | Extra capacity≈\${2:N2}/mo | Extra geo-write≈\${3:N2}/mo" -f $capGB,$mWrite,$extra,$geoWriteExtra) `
-                    -EstimatedMonthlySavingsUsd ($extra * 0.5 + $geoWriteExtra * 0.5) `
+                    -Evidence ("SKU=$sku | Capacity={0:N2} GB | Extra capacity≈`${1:N2}/mo | {2}" -f $capGB,$extra,$geoEvidence) `
+                    -EstimatedMonthlySavingsUsd ($extra * 0.5 + $geoWriteUsd * 0.5) `
                     -VerifyCommand ("az storage account show -n {0} -g {1} --query 'sku.name'" -f $SaObj.StorageAccountName,$SaObj.ResourceGroupName) `
                     -RemediationGroupKey "sku:review-dr-requirement" `
                     -RemediationScript (("# DR / RPO review required. Only apply after confirming no cross-region durability requirement.`n# az storage account update -n {0} -g {1} --sku Standard_LRS  # or Standard_ZRS for AZ-durable") -f $SaObj.StorageAccountName,$SaObj.ResourceGroupName)))
@@ -1046,7 +1329,7 @@ function Invoke-StorageAccountAnalysis {
 
     # ---- 4. Premium performance sanity check --------------------------------
     if ($sku -like 'Premium_*' -and $kind -eq 'StorageV2') {
-        if (-not $SkipMetrics -and $mTx -lt 100000 -and $capGB -ge 1) {
+        if (-not $SkipMetrics -and $txKnown -and $mTx -lt 100000 -and $capGB -ge 1) {
             $findings.Add((New-Finding `
                 -Pillar 'Performance' -Category 'Performance Tier' -Severity 'Medium' `
                 -Title "Premium performance tier with modest workload" `
@@ -1062,7 +1345,7 @@ function Invoke-StorageAccountAnalysis {
     #        Premium file shares cost ~5-10x standard. If the observed transaction
     #        rate on the account is very low, the workload is over-provisioned.
     if ($kind -eq 'FileStorage' -and $sku -like 'Premium_*') {
-        if (-not $SkipMetrics -and $mTx -lt 500000 -and $capGB -ge 1) {
+        if (-not $SkipMetrics -and $txKnown -and $mTx -lt 500000 -and $capGB -ge 1) {
             $findings.Add((New-Finding `
                 -Pillar 'Performance' -Category 'File Service' -Severity 'Medium' `
                 -Title "Premium FileStorage account with low transaction volume" `
@@ -1114,15 +1397,16 @@ function Invoke-StorageAccountAnalysis {
     $sftpEnabled = $false
     try { $sftpEnabled = [bool]$SaObj.EnableSftp } catch { }
     if ($sftpEnabled) {
-        $sev = if ($mTx -lt 10000) { 'High' } else { 'Medium' }
+        $sev = if ($txKnown -and $mTx -lt 10000) { 'High' } else { 'Medium' }
+        $sftpTxText = if ($txKnown) { '~{0:N0}' -f $mTx } else { 'n/a (metrics unavailable)' }
         $findings.Add((New-Finding `
             -Pillar 'Cost' -Category 'SFTP Protocol' -Severity $sev `
             -Title "SFTP protocol is enabled on the account" `
-            -Description ("SFTP support on a storage account is billed at a flat ~`$0.30/hour endpoint fee, regardless of transferred bytes, on top of the normal storage charges. That is approximately `$219/month per account. Observed monthly transactions on this account: ~{0:N0}.`n`nIf your team does not actually need SFTP for this workload, disabling it removes the fixed hourly fee." -f $mTx) `
+            -Description ("SFTP support on a storage account is billed at a flat ~`$0.30/hour endpoint fee, regardless of transferred bytes, on top of the normal storage charges. That is approximately `$219/month per account. Observed monthly transactions on this account: {0}.`n`nIf your team does not actually need SFTP for this workload, disabling it removes the fixed hourly fee." -f $sftpTxText) `
             -Recommendation "If no consumer connects via SFTP, disable the protocol: 'az storage account update -n <name> -g <rg> --enable-sftp false'. Keep SFTP only when a real client (partner file drop, legacy tooling) requires it." `
             -Impact "Fixed hourly fee applies whether SFTP is used or not; leaving it on 'just in case' is the most common cause of surprise storage account bills." `
-            -Evidence ("EnableSftp=True | Tx/mo=$([math]::Round($mTx))") `
-            -EstimatedMonthlySavingsUsd 219.0 `
+            -Evidence ("EnableSftp=True | Tx/mo={0}" -f $(if ($txKnown) { [string][math]::Round($mTx) } else { 'n/a' })) `
+            -EstimatedMonthlySavingsUsd $(if ($txKnown -and $mTx -lt 10000) { 219.0 } else { 0 }) `
             -VerifyCommand ("az storage account show -n {0} -g {1} --query 'enableSftp'" -f $SaObj.StorageAccountName,$SaObj.ResourceGroupName) `
             -RemediationGroupKey "sftp:disable" `
             -RemediationScript ("az storage account update -n {0} -g {1} --enable-sftp false" -f $SaObj.StorageAccountName,$SaObj.ResourceGroupName)))
@@ -1326,7 +1610,7 @@ function Invoke-StorageAccountAnalysis {
     # ---- 6d. Orphan Private Endpoint (PE with 0 transactions) ----------------
     #          Each private endpoint costs ~$7.30/mo in standing charges (excluding
     #          data-processing). Idle PEs on unused accounts are pure waste.
-    if ($SaObj.PrivateEndpointConnections -and $SaObj.PrivateEndpointConnections.Count -gt 0 -and $Metrics -and -not $Metrics.HasActivity) {
+    if ($SaObj.PrivateEndpointConnections -and $SaObj.PrivateEndpointConnections.Count -gt 0 -and $Metrics -and $Metrics.HasActivity -eq $false) {
         $peCount = $SaObj.PrivateEndpointConnections.Count
         $peSavings = [math]::Round($peCount * 7.30, 2)
         $findings.Add((New-Finding `
@@ -1343,8 +1627,9 @@ function Invoke-StorageAccountAnalysis {
     }
 
     # ---- 8. Idle / empty accounts -------------------------------------------
-    if (-not $SkipMetrics -and $Metrics) {
-        if ($capBytes -le 1MB -and -not $Metrics.HasActivity) {
+    # HasActivity is $null when the transaction totals could not be collected: never call an account idle on missing data.
+    if (-not $SkipMetrics -and $Metrics -and $Metrics.CapacityAvailable -and $Metrics.HasActivity -eq $false) {
+        if ($capBytes -le 1MB) {
             $findings.Add((New-Finding `
                 -Pillar 'Cost' -Category 'Idle Resources' -Severity 'Medium' `
                 -Title "Empty and idle storage account" `
@@ -1353,7 +1638,7 @@ function Invoke-StorageAccountAnalysis {
                 -Evidence ("Capacity={0} bytes | Tx={1}" -f $capBytes,$Metrics.Transactions) `
                 -EstimatedMonthlySavingsUsd 1 `
                 -VerifyCommand ("az monitor metrics list --resource {0} --metric Transactions --interval PT1H" -f $SaObj.Id)))
-        } elseif ($capGB -ge 10 -and -not $Metrics.HasActivity) {
+        } elseif ($capGB -ge 10) {
             $save = $capGB * (Get-TierCapacityPrice $tier)
             $findings.Add((New-Finding `
                 -Pillar 'Cost' -Category 'Idle Resources' -Severity 'High' `
@@ -1384,17 +1669,21 @@ $script:HelpersText = ''
 try {
     $selfPath = $PSCommandPath
     if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
-    $rawSelf = Get-Content -Raw -LiteralPath $selfPath
+    $rawSelf = if ($selfPath) { Get-Content -Raw -LiteralPath $selfPath }
+               else { $MyInvocation.MyCommand.ScriptBlock.ToString() }
     $m = [regex]::Match($rawSelf, '(?s)#region[^\r\n]*Analysis helpers.*?#endregion Analysis helpers')
     if ($m.Success) { $script:HelpersText = $m.Value }
 } catch { }
 if (-not $script:HelpersText) {
-    Write-Log "Could not extract helpers text for parallel workers; falling back to serial mode." WARN
+    # Without the helpers every parallel worker would fail and the report would silently come out empty.
+    throw "Could not extract the 'Analysis helpers' region for the parallel workers. Run the script from a .ps1 file."
 }
 
 $checkpointPath = Join-Path $OutputPath 'checkpoint.json'
 $results = New-Object System.Collections.Generic.List[object]
 $processedIds = @{}
+# Accounts that were discovered but could not be analysed (classic accounts, failed workers, unreachable subscriptions).
+$skippedAccounts = New-Object System.Collections.Generic.List[object]
 
 # Resume mode: load previously-processed accounts and skip them in the loop.
 if ($Resume -and (Test-Path $checkpointPath)) {
@@ -1423,23 +1712,37 @@ foreach ($g in $grouped) {
     $subId   = $g.Name
     $subName = ($subs | Where-Object Id -eq $subId).Name
     Write-Log "-> Subscription: $subName ($subId) - $($g.Count) account(s)" STEP
-    try { Set-AzContext -SubscriptionId $subId -WarningAction SilentlyContinue | Out-Null } catch { continue }
+
+    foreach ($classic in @($g.Group | Where-Object { $_.type -like '*classicstorage*' })) {
+        $skippedAccounts.Add([pscustomobject]@{ Name = $classic.name; SubscriptionName = $subName; ResourceGroup = $classic.resourceGroup; Reason = 'Classic (ASM) storage account - not analysed by this tool' }) | Out-Null
+    }
 
     $todo = @($g.Group | Where-Object { -not $processedIds.ContainsKey($_.id) -and $_.type -notlike '*classicstorage*' })
     if (-not $todo) { continue }
 
+    try { Set-AzContext -SubscriptionId $subId -WarningAction SilentlyContinue | Out-Null }
+    catch {
+        Write-Log ("Could not switch to subscription {0}: {1}. Its {2} account(s) were NOT analysed." -f $subId,$_.Exception.Message,$todo.Count) WARN
+        foreach ($t in $todo) { $skippedAccounts.Add([pscustomobject]@{ Name = $t.name; SubscriptionName = $subName; ResourceGroup = $t.resourceGroup; Reason = "Subscription context unavailable: $($_.Exception.Message)" }) | Out-Null }
+        continue
+    }
+
     $partial = $todo | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
         $row = $_
         $ErrorActionPreference = 'Stop'
+        $subId   = $using:subId
+        $subName = $using:subName
         Import-Module Az.Accounts, Az.Storage, Az.Monitor -DisableNameChecking -ErrorAction SilentlyContinue | Out-Null
-        try { $null = Set-AzContext -SubscriptionId $using:subId -WarningAction SilentlyContinue -ErrorAction Stop } catch { return $null }
+        try { $null = Set-AzContext -SubscriptionId $subId -WarningAction SilentlyContinue -ErrorAction Stop }
+        catch { return [pscustomobject]@{ __Failed = $true; Name = $row.name; SubscriptionName = $subName; ResourceGroup = $row.resourceGroup; Reason = "Subscription context unavailable: $($_.Exception.Message)" } }
+
+        # The helpers region applies -PricingOverride, so the workers need the same value as the parent.
+        $PricingOverride = $using:PricingOverride
         . ([scriptblock]::Create($using:helpersText))
 
         $MetricsDays     = $using:MetricsDays
         $SkipMetrics     = $using:SkipMetrics
         $IncludeRealCost = $using:IncludeRealCost
-        $subId           = $using:subId
-        $subName         = $using:subName
 
         try {
             $sa = Get-AzStorageAccount -ResourceGroupName $row.resourceGroup -Name $row.name -ErrorAction Stop
@@ -1459,24 +1762,36 @@ foreach ($g in $grouped) {
 
             $factor = 30.0 / [double]$MetricsDays
             $capGB  = if ($metrics -and $metrics.UsedCapacityBytes) { [math]::Round($metrics.UsedCapacityBytes/1GB,2) } else { 0 }
-            $inGB   = if ($metrics) { [math]::Round(($metrics.IngressBytes/1GB)*$factor,2) } else { 0 }
-            $egGB   = if ($metrics) { [math]::Round(($metrics.EgressBytes/1GB)*$factor,2)  } else { 0 }
-            $mRead  = if ($metrics) { [double]$metrics.ReadTx  * $factor } else { 0 }
-            $mWrite = if ($metrics) { [double]$metrics.WriteTx * $factor } else { 0 }
-            $mIngB  = if ($metrics) { [double]$metrics.IngressBytes * $factor } else { 0 }
+            $txOk   = [bool]($metrics -and $metrics.TotalsAvailable)
+            $inGB   = if ($txOk) { [math]::Round(($metrics.IngressBytes/1GB)*$factor,2) } else { $null }
+            $egGB   = if ($txOk) { [math]::Round(($metrics.EgressBytes/1GB)*$factor,2)  } else { $null }
+
+            # $usage is $null when the ApiName breakdown is missing or does not reconcile with the total.
+            $usage  = New-UsageProfile -Metrics $metrics -Days $MetricsDays
+            $bWin   = if ($metrics -and $metrics.BreakdownWindowDays) { [double]$metrics.BreakdownWindowDays } else { [double]$MetricsDays }
+            $bf     = 30.0 / $bWin
+            $metricsStatus = if ($SkipMetrics) { 'Skipped' }
+                             elseif ($metrics -and $metrics.BreakdownAvailable -and $metrics.CapacityAvailable -and $metrics.TotalsAvailable) {
+                                 if ($bWin -lt ([double]$MetricsDays - 0.5)) { 'Complete (breakdown window reduced to {0:N1} days)' -f $bWin }
+                                 elseif (@($metrics.Warnings).Count) { 'Complete (with notes)' } else { 'Complete' } }
+                             elseif ($txOk) { 'Partial' }
+                             else { 'Unavailable' }
 
             $forecast = if ($metrics -and $metrics.UsedCapacityDailyGB) { Get-CapacityForecast -DailyCapacityGB $metrics.UsedCapacityDailyGB } else { $null }
+            # Assigned through @() statements (not inline if-expressions) so one-element lists stay lists in the JSON.
+            $topApisArr = @(); $warnArr = @(); $exclArr = @()
+            if ($metrics) { $topApisArr = @($metrics.TopApis); $warnArr = @($metrics.Warnings); $exclArr = @($metrics.BreakdownDaysExcluded) }
             $realCost = Get-RealAccountCost -ResourceId $sa.Id
 
             $tierProjections = $null; $recommendedTier = $null; $tierReason = $null; $tierReasonRich = $null
             $skuProjections  = $null; $recommendedSku  = $null; $skuReason  = $null; $skuReasonRich  = $null
-            if ($sa.Kind -eq 'StorageV2' -and $capGB -ge 0.01) {
-                $projHot  = Get-TierCostBreakdown -Tier Hot  -CapacityGB $capGB -MonthlyReads $mRead -MonthlyWrites $mWrite -MonthlyIngressBytes $mIngB -Sku $sa.Sku.Name
-                $projCool = Get-TierCostBreakdown -Tier Cool -CapacityGB $capGB -MonthlyReads $mRead -MonthlyWrites $mWrite -MonthlyIngressBytes $mIngB -Sku $sa.Sku.Name
-                $projCold = Get-TierCostBreakdown -Tier Cold -CapacityGB $capGB -MonthlyReads $mRead -MonthlyWrites $mWrite -MonthlyIngressBytes $mIngB -Sku $sa.Sku.Name
+            if ($sa.Kind -eq 'StorageV2' -and $capGB -ge 0.01 -and $usage) {
+                $projHot  = Get-TierCostBreakdown -Tier Hot  -CapacityGB $capGB -Sku $sa.Sku.Name @usage
+                $projCool = Get-TierCostBreakdown -Tier Cool -CapacityGB $capGB -Sku $sa.Sku.Name @usage
+                $projCold = Get-TierCostBreakdown -Tier Cold -CapacityGB $capGB -Sku $sa.Sku.Name @usage
                 $tierProjections = @($projHot, $projCool, $projCold)
                 $curTier         = if ($sa.AccessTier) { $sa.AccessTier } else { 'Hot' }
-                $reasonInfo      = Get-TierRecommendationReason -Projections $tierProjections -CurrentTier $curTier -MonthlyReads $mRead -MonthlyWrites $mWrite -CapacityGB $capGB -MetricsDays $MetricsDays
+                $reasonInfo      = Get-TierRecommendationReason -Projections $tierProjections -CurrentTier $curTier -CapacityGB $capGB -MetricsDays $MetricsDays @usage
                 $recommendedTier = $reasonInfo.RecommendedTier
                 $tierReason      = $reasonInfo.Reason
                 $tierReasonRich  = [pscustomobject]@{
@@ -1487,12 +1802,11 @@ foreach ($g in $grouped) {
                     Action         = $reasonInfo.Action
                 }
 
-                $skuRec = Get-SkuRecommendationReason -CurrentSku $sa.Sku.Name -CurrentTier $curTier `
-                    -CapacityGB $capGB -MonthlyReads $mRead -MonthlyWrites $mWrite -MonthlyIngressBytes $mIngB -MetricsDays $MetricsDays
+                $skuRec = Get-SkuRecommendationReason -CurrentSku $sa.Sku.Name -CurrentTier $curTier -CapacityGB $capGB -MetricsDays $MetricsDays @usage
                 if ($skuRec) {
                     $recommendedSku  = $skuRec.RecommendedSku
                     $skuReason       = $skuRec.Reason
-                    $skuProjections  = @($skuRec.Projections.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Sku = $_.Key; TotalCost = $_.Value } })
+                    $skuProjections  = @(@('Standard_LRS','Standard_ZRS','Standard_GRS','Standard_RAGRS','Standard_GZRS','Standard_RAGZRS') | Where-Object { $skuRec.Projections.ContainsKey($_) } | ForEach-Object { [pscustomobject]@{ Sku = $_; TotalCost = $skuRec.Projections[$_] } })
                     $skuReasonRich   = [pscustomobject]@{
                         DataSource     = $skuRec.DataSource
                         Observations   = $skuRec.Observations
@@ -1522,9 +1836,21 @@ foreach ($g in $grouped) {
                 TierRecommendationDetails = $tierReasonRich
                 TierProjections     = $tierProjections
                 UsedCapacityGB      = $capGB
-                TransactionsMonthly = if ($metrics) { [int64]($metrics.Transactions * $factor) } else { 0 }
-                ReadMonthly         = if ($metrics) { [int64]($metrics.ReadTx       * $factor) } else { 0 }
-                WriteMonthly        = if ($metrics) { [int64]($metrics.WriteTx      * $factor) } else { 0 }
+                TransactionsMonthly = if ($txOk) { [int64]($metrics.Transactions * $factor) } else { $null }
+                ReadMonthly         = if ($usage) { [int64]$usage.MonthlyReads }   else { $null }
+                WriteMonthly        = if ($usage) { [int64]$usage.MonthlyWrites }  else { $null }
+                ListMonthly         = if ($usage) { [int64]$usage.MonthlyListOps } else { $null }
+                OtherMonthly        = if ($usage) { [int64](($metrics.OtherTx + $metrics.FreeTx) * $bf) } else { $null }
+                NonBlobMonthly      = if ($usage) { [int64]($metrics.NonBlobTx * $bf) } else { $null }
+                UnclassifiedMonthly = if ($usage) { [int64]($metrics.UnknownTx * $bf) } else { $null }
+                BreakdownWindowDays = if ($usage) { [math]::Round($bWin, 1) } else { $null }
+                TransactionsObserved = if ($txOk) { [int64]$metrics.Transactions } else { $null }
+                ClassifiedObserved  = if ($usage) { [int64]($metrics.ReadTx + $metrics.WriteTx + $metrics.ListTx + $metrics.OtherTx + $metrics.FreeTx + $metrics.NonBlobTx + $metrics.UnknownTx) } else { $null }
+                BreakdownCoverage   = if ($metrics) { $metrics.BreakdownCoverage } else { $null }
+                BreakdownDaysExcluded = $exclArr
+                TopApis             = $topApisArr
+                MetricsStatus       = $metricsStatus
+                MetricsWarnings     = $warnArr
                 IngressGBMonthly    = $inGB
                 EgressGBMonthly     = $egGB
                 Availability        = if ($metrics) { $metrics.Availability } else { $null }
@@ -1543,13 +1869,17 @@ foreach ($g in $grouped) {
                 Tags                = ($row.tags | ConvertTo-Json -Compress -Depth 4)
             }
         } catch {
-            Write-Warning ("Failed {0}: {1}" -f $row.name, $_.Exception.Message)
-            return $null
+            return [pscustomobject]@{ __Failed = $true; Name = $row.name; SubscriptionName = $subName; ResourceGroup = $row.resourceGroup; Reason = $_.Exception.Message }
         }
     }
 
     foreach ($r in $partial) {
         if ($null -eq $r) { continue }
+        if ($r.PSObject.Properties['__Failed']) {
+            Write-Log ("Failed to analyse {0} ({1}): {2}" -f $r.Name,$r.SubscriptionName,$r.Reason) WARN
+            $skippedAccounts.Add([pscustomobject]@{ Name = $r.Name; SubscriptionName = $r.SubscriptionName; ResourceGroup = $r.ResourceGroup; Reason = $r.Reason }) | Out-Null
+            continue
+        }
         $results.Add($r) | Out-Null
         $done++
     }
@@ -1572,6 +1902,13 @@ Write-Progress -Activity "Analyzing storage accounts" -Completed
 if (Test-Path $checkpointPath) { try { Remove-Item -LiteralPath $checkpointPath -Force } catch { } }
 
 Write-Log ("Analysis complete: {0} accounts, {1} findings" -f $results.Count, (($results | ForEach-Object { $_.Findings.Count }) | Measure-Object -Sum).Sum) OK
+if ($skippedAccounts.Count -gt 0) {
+    Write-Log ("{0} discovered account(s) were NOT analysed (see the report banner): {1}" -f $skippedAccounts.Count, (($skippedAccounts | ForEach-Object { $_.Name }) -join ', ')) WARN
+}
+$metricsIncomplete = @($results | Where-Object { $_.MetricsStatus -and $_.MetricsStatus -notmatch '^(Complete|Skipped)' })
+if ($metricsIncomplete.Count -gt 0) {
+    Write-Log ("{0} account(s) have incomplete Azure Monitor metrics; read/write figures and projections were withheld: {1}" -f $metricsIncomplete.Count, (($metricsIncomplete | ForEach-Object { $_.Name }) -join ', ')) WARN
+}
 
 #region ------------------------------------------------------------- Reserved Capacity aggregation
 # Reserved Capacity for Azure Storage is sold in 100 TB and 1 PB blocks per
@@ -1594,20 +1931,26 @@ foreach ($g in $rcGroups) {
     $totalTB  = [math]::Round($totalGB / 1024.0, 2)
     if ($totalTB -lt $rcMinTB) { continue }
 
-    $accounts     = @($g.Group | ForEach-Object { $_.Name })
+    $ranked       = @($g.Group | Sort-Object UsedCapacityGB -Descending)
+    $accounts     = @($ranked | ForEach-Object { $_.Name })
     $tierPrice    = if ($tier) { Get-TierCapacityPrice $tier } else { $script:Pricing.CapacityGBMonth_Hot }
     $redundMult   = if ($script:Pricing.RedundancyMultiplier[$sku]) { $script:Pricing.RedundancyMultiplier[$sku] } else { 1.0 }
+    # Reservations are bought in whole 100 TB blocks, so only the full blocks are discounted.
+    $reservedTB   = [math]::Floor($totalTB / 100.0) * 100
     $onDemandMo   = $totalGB * $tierPrice * $redundMult
-    $save1Yr      = $onDemandMo * $script:Pricing.ReservedCapacity_1YrDiscount
-    $save3Yr      = $onDemandMo * $script:Pricing.ReservedCapacity_3YrDiscount
+    $reservedMo   = $reservedTB * 1024.0 * $tierPrice * $redundMult
+    $save1Yr      = $reservedMo * $script:Pricing.ReservedCapacity_1YrDiscount
+    $save3Yr      = $reservedMo * $script:Pricing.ReservedCapacity_3YrDiscount
 
     $rcOpportunities.Add([pscustomobject]@{
         Region       = $region
         Tier         = $tier
         Sku          = $sku
         TotalTB      = $totalTB
+        ReservedTB   = $reservedTB
         AccountCount = $accounts.Count
         Accounts     = $accounts
+        AnchorResourceId = $ranked[0].ResourceId
         OnDemandMo   = [math]::Round($onDemandMo, 2)
         Save1YrMo    = [math]::Round($save1Yr, 2)
         Save3YrMo    = [math]::Round($save3Yr, 2)
@@ -1622,8 +1965,7 @@ if ($rcOpportunities.Count -gt 0) {
 
         # Anchor the finding to the largest account in the group so users have
         # a natural entry point when clicking through from the Findings table.
-        $anchor = $opp.Accounts[0]
-        $anchorResult = $results | Where-Object { $_.Name -eq $anchor } | Select-Object -First 1
+        $anchorResult = $results | Where-Object { $_.ResourceId -eq $opp.AnchorResourceId } | Select-Object -First 1
         if (-not $anchorResult) { continue }
 
         $desc = "Data source. Aggregated 'UsedCapacity' from Azure Monitor across the accounts listed below.`n`n" `
@@ -1634,10 +1976,10 @@ if ($rcOpportunities.Count -gt 0) {
               + ("  - Combined stored data: {0} TB across {1} accounts`n" -f $opp.TotalTB,$opp.AccountCount) `
               + ("  - Accounts in group: {0}`n" -f ($opp.Accounts -join ', ')) `
               + "`n" `
-              + "Why this matters. Azure Storage Reserved Capacity gives 20% (1-year) or 38% (3-year) off the on-demand capacity price when you commit to a minimum of 100 TB in a single (region, tier, redundancy family). Your combined footprint in this group exceeds that threshold today.`n`n" `
-              + ("Cost projection: On-demand=`${0:N2}/mo | 1-year reservation=`${1:N2}/mo saved | 3-year reservation=`${2:N2}/mo saved." -f $opp.OnDemandMo,$opp.Save1YrMo,$opp.Save3YrMo)
+              + "Why this matters. Azure Storage Reserved Capacity gives 20% (1-year) or 38% (3-year) off the on-demand capacity price when you commit to a minimum of 100 TB in a single (region, tier, redundancy family). Your combined footprint in this group exceeds that threshold today. Only whole 100 TB blocks are discounted, and only block blob / Data Lake data is eligible, so validate how much of the reported capacity is blob data before purchasing.`n`n" `
+              + ("Cost projection: On-demand (whole group)=`${0:N2}/mo | savings on {1} TB of reservable blocks: 1-year=`${2:N2}/mo, 3-year=`${3:N2}/mo." -f $opp.OnDemandMo,$opp.ReservedTB,$opp.Save1YrMo,$opp.Save3YrMo)
 
-        $recommendation = "Purchase an Azure Storage Reserved Capacity of at least $($opp.TotalTB) TB for '$($opp.Region) / $($opp.Tier) / $($opp.Sku)' via the Portal (Reservations blade) or CLI. Reserved Capacity is billing-only — you do not need to migrate data or change account configuration. It applies automatically to the eligible accounts in that region."
+        $recommendation = "Purchase an Azure Storage Reserved Capacity of $($opp.ReservedTB) TB for '$($opp.Region) / $($opp.Tier) / $($opp.Sku)' via the Portal (Reservations blade) or CLI. Reserved Capacity is billing-only — you do not need to migrate data or change account configuration. It applies automatically to the eligible accounts in that region."
 
         $remCmd = "# Reservation purchase requires the Portal or the Azure Reservations REST API (no direct 'az' command).`n" `
                 + "# Portal path: Home > Reservations > Add > Storage.`n" `
@@ -1645,7 +1987,7 @@ if ($rcOpportunities.Count -gt 0) {
                 + "#   Region:  $($opp.Region)`n" `
                 + "#   Tier:    $($opp.Tier)`n" `
                 + "#   SKU:     $($opp.Sku)`n" `
-                + "#   Size:    at least $([math]::Ceiling($opp.TotalTB / 100.0) * 100) TB   (bought in 100 TB blocks)`n" `
+                + "#   Size:    $($opp.ReservedTB) TB   (bought in 100 TB blocks)`n" `
                 + "#   Term:    3-year for maximum saving, 1-year for flexibility."
 
         $rcFinding = New-Finding `
@@ -1729,7 +2071,8 @@ $totalSavings = [math]::Round((($flatFindings | Measure-Object EstimatedMonthlyS
 # JSON payloads — helper guarantees an array shape regardless of element count.
 function ConvertTo-JsonArray {
     param($InputObject, [int] $Depth = 6)
-    $arr = @($InputObject)
+    # @() over a List[object] throws "Argument types do not match" on PowerShell 7.6, so unwrap it first.
+    $arr = if ($InputObject -is [System.Collections.Generic.List[object]]) { $InputObject.ToArray() } else { @($InputObject) }
     if ($arr.Count -eq 0) { return '[]' }
     if ($arr.Count -eq 1) { return '[' + ($arr[0] | ConvertTo-Json -Depth $Depth -Compress) + ']' }
     return ($arr | ConvertTo-Json -Depth $Depth -Compress)
@@ -1738,6 +2081,7 @@ function ConvertTo-JsonArray {
 $accountsJson = ConvertTo-JsonArray ($results | Select-Object * -ExcludeProperty Findings)
 $findingsJson = ConvertTo-JsonArray $flatFindings
 $subsJson     = ConvertTo-JsonArray ($results | Select-Object SubscriptionId,SubscriptionName -Unique) -Depth 3
+$skippedJson  = ConvertTo-JsonArray $skippedAccounts -Depth 3
 
 # Aggregations (kept: severity + pillar. Removed: kind/sku/tier — low signal, high visual noise).
 $byPillar   = @($flatFindings  | Group-Object Pillar   | ForEach-Object { [pscustomobject]@{ label = "$($_.Name)"; value = $_.Count } })
@@ -2052,6 +2396,8 @@ $htmlTemplate = @'
 
 <div class="container">
 
+  <!-- Data-quality banner: accounts that could not be analysed or whose metrics are incomplete. -->
+  <section id="dqBanner" class="hidden" style="background:#FFF4CE;border:1px solid #FFB900;border-left:4px solid #FFB900;border-radius:6px;padding:12px 16px;margin-bottom:16px;font-size:13px;color:#323130;"></section>
   <!-- Scope selector: filters KPIs, pillars, Overview table, and tab-level filters
        by a single subscription, or shows the full tenant. -->
   <section class="scope-bar">
@@ -2257,15 +2603,17 @@ $htmlTemplate = @'
       <div class="card-body" style="max-width: 900px;">
         <h3 style="margin-top:0;">How this assessment works</h3>
         <p><b>Scope.</b> Every Storage Account visible to the signed-in principal is discovered via Azure Resource Graph and inspected with the modern <code>Az.Storage</code>, <code>Az.Monitor</code> and <code>Az.Accounts</code> modules. The script is strictly <b>read-only</b> — it never creates, updates or deletes any Azure resource.</p>
-        <p><b>Metrics.</b> For each account we pull Azure Monitor metrics for the last <b>__METRICS_DAYS__ days</b>: <code>UsedCapacity</code>, <code>Transactions</code> (split by ApiName into Read / Write / Other), <code>Ingress</code>, <code>Egress</code> and <code>Availability</code>. Monthly figures in the report are the observed totals extrapolated to a 30-day month.</p>
+        <p><b>Metrics.</b> For each account we pull Azure Monitor metrics for the last <b>__METRICS_DAYS__ days</b>: <code>UsedCapacity</code>, <code>Transactions</code> (split by ApiName into Read / Write / List &amp; create container / Other / Free / non-blob), <code>Ingress</code>, <code>Egress</code> and <code>Availability</code>. Monthly figures in the report are the observed totals extrapolated to a 30-day month. The ApiName breakdown is reconciled against the unsplit transaction total day by day; if recent days do not reconcile (Azure Monitor sometimes holds transactions without an ApiName), the breakdown uses the longest recent window that does and says so. If no window of at least 7 days reconciles within 5%, the account shows <b>n/a</b> for read/write figures, no tier or replication projection is produced and a Data Quality finding explains why. Operations are classified with the <a href="https://learn.microsoft.com/azure/storage/blobs/map-rest-apis-transaction-categories" target="_blank" rel="noopener">Azure Blob Storage operation-to-price mapping</a>.</p>
         <p><b>Pillars.</b> Findings are grouped in two pillars aligned to the goal of this tool: <span class="badge b-cost">Cost</span> (access tier vs. transaction pattern, redundancy vs. usage, lifecycle, retention, idle capacity, GPv1 pre-migration guidance) and <span class="badge b-performance">Performance</span> (Premium tier match to workload). This is strictly a cost &amp; performance optimizer; security posture belongs in a dedicated assessment.</p>
 
         <h3 style="margin-top:20px;">Tier recommendation model</h3>
         <p>For every <code>StorageV2</code> account we compute the projected monthly cost at <b>Hot</b>, <b>Cool</b> and <b>Cold</b> tiers using the actual observed load, then recommend the cheapest tier.</p>
         <p>The math per tier is:</p>
         <pre style="background:#F3F2F1;padding:12px;border-radius:6px;font-size:12.5px;line-height:1.7;">TotalCost = CapacityGB × capacity_price(tier) × redundancy_multiplier(sku)
-          + (writes / 10,000) × write_price(tier) × geo_write_multiplier(sku)
+          + ((writes + list/create-container ops) / 10,000) × write_price(tier) × geo_write_multiplier(sku)
           + (reads  / 10,000) × read_price(tier)
+          + (other ops / 10,000) × other_ops_price        (flat in every tier)
+          + egress GB × data_retrieval_price(tier)         (Cool/Cold only)
           + <b>small_blob_penalty</b>   (Cool/Cold only, see below)</pre>
 
         <h4>Small-blob write penalty (128 KB minimum billable object size)</h4>
@@ -2275,10 +2623,19 @@ $htmlTemplate = @'
         <p>Geo-redundant SKUs (<code>GRS</code>, <code>RA-GRS</code>, <code>GZRS</code>, <code>RA-GZRS</code>) replicate every write to the secondary region. That means <b>every write operation is billed for both regions</b>, effectively doubling the write-ops line item. This is one of the hidden multipliers behind unexpected bill increases and is included in the cost projection.</p>
 
         <h4>Redundancy uplifts (LRS = 1.00x baseline for capacity)</h4>
-        <p><code>ZRS</code> = 1.25x · <code>GRS</code> = 2.00x · <code>RA-GRS</code> = 2.50x · <code>GZRS</code> = 2.50x · <code>RA-GZRS</code> = 3.13x</p>
+        <p><code>ZRS</code> = 1.25x · <code>GRS</code> = 2.20x · <code>RA-GRS</code> = 2.83x · <code>GZRS</code> = 2.25x · <code>RA-GZRS</code> = 2.81x (derived from East US Hot list prices)</p>
 
         <h3 style="margin-top:20px;">GPv1 → GPv2 migration warning</h3>
         <p>GPv2 uses tier-based per-transaction pricing that is <b>2–5x higher</b> than GPv1 for Cool/Cold tiers on the write ops, and it also applies the 128 KB minimum-billable-blob rule. Migrating a GPv1 account to GPv2 <b>without validating the correct access tier for the observed workload</b> is the #1 cause of unexpected bill spikes (a real customer case saw a ~150x jump). For every GPv1 account still in the tenant, a High-severity Cost finding surfaces so the team can plan the migration correctly.</p>
+
+        <h3 style="margin-top:20px;">Metrics validation</h3>
+        <p>Use this table to check the operation counts against the portal (<b>Monitoring &gt; Metrics &gt; Transactions</b>, split by <b>API name</b>, same window). <b>Azure Monitor total</b> is the unsplit Transactions metric over the whole window; <b>Classified</b> is the sum of all ApiName series over the days the breakdown uses; they should match (coverage 95-105%). A shorter <b>Breakdown window</b> means Azure Monitor held some days' transactions without an ApiName and those days were excluded from the read/write figures. The same data is written to <code>StorageOptimizer_metrics_validation_&lt;runid&gt;.csv</code>.</p>
+        <div style="overflow:auto;max-height:420px;">
+          <table class="data" id="tblValidation" style="font-size:12px;">
+            <thead><tr><th>Account</th><th>Status</th><th class="right">Breakdown window (days)</th><th class="right">Azure Monitor total</th><th class="right">Classified</th><th class="right">Coverage</th><th>Top ApiName</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
 
         <h3 style="margin-top:20px;">Estimates and validation</h3>
         <p>Savings are directional and use public list prices (East US region baseline). They do <b>not</b> reflect EA/CSP discounts, reservations, or region-specific meters. Validate every recommendation against the actual bill in <b>Cost Management + Billing</b> before applying changes.</p>
@@ -2307,6 +2664,7 @@ $htmlTemplate = @'
 <script type="application/json" id="data-findings">__FINDINGS_JSON__</script>
 <script type="application/json" id="data-agg">__AGG_JSON__</script>
 <script type="application/json" id="data-subs">__SUBS_JSON__</script>
+<script type="application/json" id="data-skipped">__SKIPPED_JSON__</script>
 <script type="application/json" id="data-compare">__COMPARE_JSON__</script>
 
 <script>
@@ -2321,6 +2679,7 @@ const ACCOUNTS = loadJson('data-accounts', []);
 const FINDINGS = loadJson('data-findings', []);
 const AGG      = loadJson('data-agg',      { byPillar:[], byCategory:[], bySeverity:[] });
 const SUBS     = loadJson('data-subs',     []);
+const SKIPPED  = loadJson('data-skipped',  []);
 const COMPARE  = loadJson('data-compare',  null);
 
 // Build a set of prior finding keys (Account+Title) so we can flag current findings
@@ -2606,6 +2965,30 @@ function boolBadge(v, yesLabel, noLabel) {
   if (v === false) return '<span class="badge b-no">'  + (noLabel||'No')  + '</span>';
   return '<span class="muted">-</span>';
 }
+// A one-element list can arrive as a plain string (or null); normalise before using array methods.
+function asArr(v) { return v == null ? [] : (Array.isArray(v) ? v : [v]); }
+// null / undefined means "not collected" (shown as n/a); a real 0 is shown as 0.
+function fmtInt(v) { return v == null ? 'n/a' : Number(v).toLocaleString(); }
+function fmtFixed(v, d) { return v == null ? 'n/a' : Number(v).toFixed(d); }
+
+// Banner: accounts that were not analysed + accounts whose Azure Monitor data is incomplete.
+(function renderDataQualityBanner() {
+  const el = document.getElementById('dqBanner');
+  if (!el) return;
+  const incomplete = ACCOUNTS.filter(a => a.MetricsStatus && !/^(Complete|Skipped)/.test(a.MetricsStatus));
+  if (!SKIPPED.length && !incomplete.length) return;
+  let h = '<b>Data-quality notice.</b> ';
+  if (SKIPPED.length) {
+    h += SKIPPED.length + ' discovered account(s) are <b>not included</b> in this report: '
+      + SKIPPED.map(s => '<b>' + esc(s.Name) + '</b> (' + esc(s.Reason) + ')').join('; ') + '. ';
+  }
+  if (incomplete.length) {
+    h += incomplete.length + ' account(s) have incomplete Azure Monitor metrics, so read/write figures show <b>n/a</b> and no tier or replication savings are claimed for them: '
+      + incomplete.map(a => '<b>' + esc(a.Name) + '</b>').join(', ') + '. ';
+  }
+  el.innerHTML = h;
+  el.classList.remove('hidden');
+})();
 // Recommendation badge for the tier column. Includes native tooltip (title attribute)
 // with the human-readable reason so users see the "why" on hover, and a "?" affordance
 // that hints at the click-through drill-down.
@@ -2733,8 +3116,8 @@ function renderAccounts() {
     + '<td>' + esc(a.AccessTier||'n/a') + '</td>'
     + '<td>' + tierRecoBadge(a) + '</td>'
     + '<td class="right">' + (a.UsedCapacityGB||0).toFixed(2) + '</td>'
-    + '<td class="right">' + (a.TransactionsMonthly||0).toLocaleString() + '</td>'
-    + '<td class="right">' + (a.EgressGBMonthly||0).toFixed(2) + '</td>'
+    + '<td class="right">' + fmtInt(a.TransactionsMonthly) + '</td>'
+    + '<td class="right">' + fmtFixed(a.EgressGBMonthly, 2) + '</td>'
     + '<td class="right">' + (findByAcc[a.ResourceId]||0) + '</td>'
     + '</tr>'
   ).join('') || '<tr><td colspan="13" class="empty">No accounts match the current filters.</td></tr>';
@@ -2742,6 +3125,24 @@ function renderAccounts() {
 }
 ['aSearch','aSub','aTier'].forEach(id => document.getElementById(id).addEventListener('input', renderAccounts));
 renderAccounts();
+
+// ------------- Metrics validation table -------------
+function renderValidation() {
+  const tbody = document.querySelector('#tblValidation tbody');
+  if (!tbody) return;
+  tbody.innerHTML = ACCOUNTS.map(a => {
+    const cov = a.BreakdownCoverage;
+    const covTxt = cov == null ? 'n/a' : (cov * 100).toFixed(1) + '%';
+    return '<tr><td><b>' + esc(a.Name) + '</b></td>'
+      + '<td>' + esc(a.MetricsStatus || '-') + '</td>'
+      + '<td class="right">' + fmtFixed(a.BreakdownWindowDays, 1) + '</td>'
+      + '<td class="right">' + fmtInt(a.TransactionsObserved) + '</td>'
+      + '<td class="right">' + fmtInt(a.ClassifiedObserved) + '</td>'
+      + '<td class="right">' + covTxt + '</td>'
+      + '<td class="tiny">' + esc(asArr(a.TopApis).slice(0, 4).join(', ')) + '</td></tr>';
+  }).join('') || '<tr><td colspan="7" class="empty">No accounts.</td></tr>';
+}
+try { renderValidation(); } catch (e) { console.error('renderValidation', e); }
 
 // ------------- Overview table -------------
 function renderOverviewTable() {
@@ -2759,8 +3160,8 @@ function renderOverviewTable() {
     + '<td>' + esc(a.AccessTier||'n/a') + '</td>'
     + '<td>' + tierRecoBadge(a) + '</td>'
     + '<td class="right">' + (a.UsedCapacityGB||0).toFixed(2) + '</td>'
-    + '<td class="right">' + (a.TransactionsMonthly||0).toLocaleString() + '</td>'
-    + '<td class="right">' + (a.EgressGBMonthly||0).toFixed(2) + '</td>'
+    + '<td class="right">' + fmtInt(a.TransactionsMonthly) + '</td>'
+    + '<td class="right">' + fmtFixed(a.EgressGBMonthly, 2) + '</td>'
     + '<td class="right">' + (a.LifecycleRules||0) + '</td>'
     + '<td>' + boolBadge(a.Versioning) + '</td>'
     + '<td class="right">' + (findByAcc[a.ResourceId]||0) + '</td>'
@@ -2784,19 +3185,33 @@ function showAccount(id) {
     ['Soft-delete days', a.SoftDeleteDays||0],
     ['Blob versioning', a.Versioning ? 'Enabled' : 'Disabled'],
     ['Used capacity (GB)', (a.UsedCapacityGB||0).toFixed(2)],
-    ['Transactions / month', (a.TransactionsMonthly||0).toLocaleString()],
-    ['Reads / month', (a.ReadMonthly||0).toLocaleString()],
-    ['Writes / month', (a.WriteMonthly||0).toLocaleString()],
-    ['Ingress GB / month', (a.IngressGBMonthly||0).toFixed(2)],
-    ['Egress GB / month', (a.EgressGBMonthly||0).toFixed(2)],
+    ['Metrics status', a.MetricsStatus || '-'],
+    ['Breakdown window (days)', a.BreakdownWindowDays == null ? 'n/a' : a.BreakdownWindowDays],
+    ['Transactions / month', fmtInt(a.TransactionsMonthly)],
+    ['Reads / month', fmtInt(a.ReadMonthly)],
+    ['Writes / month', fmtInt(a.WriteMonthly)],
+    ['List & create container / month', fmtInt(a.ListMonthly)],
+    ['Other + free ops / month', fmtInt(a.OtherMonthly)],
+    ['Table / Queue / File ops / month', fmtInt(a.NonBlobMonthly)],
+    ['Unclassified ops / month', fmtInt(a.UnclassifiedMonthly)],
+    ['Ingress GB / month', fmtFixed(a.IngressGBMonthly, 2)],
+    ['Egress GB / month', fmtFixed(a.EgressGBMonthly, 2)],
+    ['Top ApiName (window total)', asArr(a.TopApis).length ? asArr(a.TopApis).join(', ') : '-'],
     ['Availability %', a.Availability!=null?a.Availability:'-']
   ];
+  if (asArr(a.MetricsWarnings).length) {
+    cfg.push(['Metrics notes', asArr(a.MetricsWarnings).join(' | ')]);
+  }
   let cfgHtml = '<h4 style="margin:0 0 10px;color:#323130;">Configuration</h4><div class="cfg-grid">';
   cfg.forEach(kv => { cfgHtml += '<div class="k">' + esc(kv[0]) + '</div><div class="v">' + esc(kv[1]) + '</div>'; });
   cfgHtml += '</div>';
 
   // ---- Tier cost projection ----
   let projHtml = '';
+  if (a.Kind === 'StorageV2' && !(a.TierProjections && a.TierProjections.length) && a.MetricsStatus && !['Skipped'].includes(a.MetricsStatus) && !String(a.MetricsStatus).startsWith('Complete')) {
+    projHtml += '<div style="background:#FFF4CE;border-left:4px solid #FFB900;padding:12px 16px;border-radius:6px;margin:12px 0;font-size:13px;color:#484644;">'
+      + '<b>Tier and replication projections were not produced.</b> The Azure Monitor operation breakdown (Transactions by ApiName) could not be collected or did not reconcile with the total, so the report does not guess read/write costs. See the &quot;Metrics notes&quot; row above.</div>';
+  }
   if (a.TierProjections && a.TierProjections.length) {
     const cheapest = a.RecommendedTier;
     const changes  = cheapest && a.AccessTier !== cheapest;
@@ -2845,9 +3260,9 @@ function showAccount(id) {
         + '</div>';
     }
 
-    projHtml += '<h4 style="margin:12px 0 8px;color:#323130;">Tier cost projection at observed usage <span class="tiny muted">(capacity + read ops + write ops + Cool/Cold small-blob penalty)</span></h4>';
+    projHtml += '<h4 style="margin:12px 0 8px;color:#323130;">Tier cost projection at observed usage <span class="tiny muted">(capacity + read / write / other ops + Cool/Cold data retrieval + small-blob penalty)</span></h4>';
     projHtml += '<table class="data" style="margin-bottom:16px;"><thead><tr>'
-      + '<th>Tier</th><th class="right">Capacity</th><th class="right">Read ops</th><th class="right">Write ops</th><th class="right">Small-blob penalty</th><th class="right">Total / month</th><th></th>'
+      + '<th>Tier</th><th class="right">Capacity</th><th class="right">Read ops</th><th class="right">Write + list ops</th><th class="right">Other ops</th><th class="right">Data retrieval</th><th class="right">Small-blob penalty</th><th class="right">Total / month</th><th></th>'
       + '</tr></thead><tbody>';
     a.TierProjections.forEach(p => {
       const isCurrent = p.Tier === a.AccessTier;
@@ -2861,6 +3276,8 @@ function showAccount(id) {
         + '<td class="right">$' + p.CapacityCost.toFixed(2) + '</td>'
         + '<td class="right">$' + p.ReadOpsCost.toFixed(2) + '</td>'
         + '<td class="right">$' + p.WriteOpsCost.toFixed(2) + '</td>'
+        + '<td class="right">$' + (p.OtherOpsCost||0).toFixed(2) + '</td>'
+        + '<td class="right">$' + (p.RetrievalCost||0).toFixed(2) + '</td>'
         + '<td class="right">' + (p.SmallWritePenalty > 0 ? '$'+p.SmallWritePenalty.toFixed(2) : '-') + '</td>'
         + '<td class="right"><b>$' + p.TotalCost.toFixed(2) + '</b></td>'
         + '<td>' + flag + '</td>'
@@ -3006,6 +3423,7 @@ $accountsJsonSafe = Protect-JsonForHtml $accountsJson
 $findingsJsonSafe = Protect-JsonForHtml $findingsJson
 $aggJsonSafe      = Protect-JsonForHtml $aggJson
 $subsJsonSafe     = Protect-JsonForHtml $subsJson
+$skippedJsonSafe  = Protect-JsonForHtml $skippedJson
 
 # Prior-run summary for comparison. Keep it small — only title+account is needed
 # to identify a finding as "resolved" or "still open" on the next run.
@@ -3040,6 +3458,7 @@ $html = $htmlTemplate.
     Replace('__FINDINGS_JSON__',  $findingsJsonSafe).
     Replace('__AGG_JSON__',       $aggJsonSafe).
     Replace('__SUBS_JSON__',      $subsJsonSafe).
+    Replace('__SKIPPED_JSON__',   $skippedJsonSafe).
     Replace('__COMPARE_JSON__',   $compareJsonSafe)
 
 # Save
@@ -3066,6 +3485,21 @@ try {
     Write-Log ("Failed to write integrity hash: {0}" -f $_.Exception.Message) WARN
 }
 
+# ----- Metrics validation CSV: lets the customer verify the operation counts against the portal -----
+$validationFile = Join-Path $OutputPath ("StorageOptimizer_metrics_validation_{0}.csv" -f $runId)
+try {
+    $results | Select-Object Name, SubscriptionName, ResourceGroup, Kind, Sku, AccessTier, MetricsStatus, BreakdownWindowDays,
+        TransactionsObserved, ClassifiedObserved, BreakdownCoverage,
+        @{ n = 'BreakdownDaysExcluded'; e = { @($_.BreakdownDaysExcluded) -join ' ' } },
+        ReadMonthly, WriteMonthly, ListMonthly, OtherMonthly, NonBlobMonthly, UnclassifiedMonthly,
+        @{ n = 'TopApis'; e = { @($_.TopApis) -join '; ' } },
+        @{ n = 'Warnings'; e = { @($_.MetricsWarnings) -join ' | ' } } |
+        Export-Csv -LiteralPath $validationFile -NoTypeInformation -Encoding UTF8
+    Write-Log "Metrics validation CSV: $validationFile" OK
+} catch {
+    Write-Log ("Metrics validation CSV failed: {0}" -f $_.Exception.Message) WARN
+}
+
 # ----- JSON snapshot (used by -CompareWith on future runs) -----
 $snapshotFile = Join-Path $OutputPath ("StorageOptimizer_snapshot_{0}.json" -f $runId)
 try {
@@ -3074,6 +3508,7 @@ try {
         GeneratedAt    = $reportDate
         MetricsDays    = $MetricsDays
         TotalAccounts  = $totalAccounts
+        SkippedAccounts = $skippedAccounts
         TotalSavings   = $totalSavings
         Accounts       = $results
         Findings       = $flatFindings

@@ -36,7 +36,9 @@ Deep, parallelized analysis of every Storage Account visible to the authenticate
 - **Interactive HTML report** — self-contained single file, Microsoft Fluent light theme, tabs for Overview / Findings / Accounts / Methodology.
 - **Global scope selector** — filter the whole report by subscription or view the full tenant.
 - **Parallel execution** — `ForEach-Object -Parallel` with per-subscription batching. ~5-7× speedup on 700-account tenants.
-- **Batched Azure Monitor calls** — 3 API calls per account instead of 6 (UsedCapacity + Availability batched, Transactions + Ingress + Egress batched, one call for ApiName split).
+- **Batched Azure Monitor calls** — 4 API calls per account: UsedCapacity, Availability (isolated so a failure never discards capacity), Transactions + Ingress + Egress batched, and one call for the ApiName split.
+- **Validated read/write breakdown** — the ApiName split is classified with the Azure Blob operation-to-price mapping and reconciled against the unsplit transaction total **day by day**. If recent days do not reconcile (Azure Monitor sometimes holds transactions without an ApiName), the longest recent window that does is used and reported; if none reconciles (±5 %), the account shows `n/a` instead of `0`, no tier / replication projection is produced, and a *Data Quality* finding explains why.
+- **Self-verification** — the Methodology tab lists, per account, the Azure Monitor total, the classified total, the coverage and the window used; the same data is written to `StorageOptimizer_metrics_validation_<runid>.csv` so the customer can compare it with the portal (Transactions split by API name).
 - **HTTP 429 backoff** — automatic 3-attempt retry with 2-8s jitter on Azure Monitor throttling.
 - **Transparent cost math** — every recommendation lists the data source, the metrics used, the formula, and the projected savings. `<details>` toggles inside every finding show the raw metrics.
 - **Bulk actions card** — findings grouped by (category + normalized recommendation) with a "Download all remediations (.sh)" button so 700-account tenants can act at scale.
@@ -218,17 +220,21 @@ Get-FileHash -Algorithm SHA256 './StorageOptimizer_<runid>.html'
 
 The audit found no correctness bugs, but these are inherent modeling limits:
 
-1. **List price is directional.** Defaults are Azure public list prices (East US baseline). Use `-PricingOverride` to inject the customer's EA / MCA prices.
+1. **List price is directional.** Defaults are Azure public list prices (East US baseline, checked against the Azure Retail Prices API on 2026-10-21). Use `-PricingOverride` to inject the customer's EA / MCA prices.
 2. **No blob-level tier distribution.** `UsedCapacity` is account-level. If a policy already moved 40 % of blobs to Archive, tier-projection math still uses the account-level number (conservative simplification).
 3. **No cross-region egress cost.** If storage is in East US and consumer is in West Europe, egress bandwidth is not modeled here.
-4. **Small-blob penalty derives avg blob size** from `IngressBytes / PutBlob count`. For workloads dominated by `AppendBlob` or `PutBlockList`, that is an approximation.
+4. **Small-blob penalty derives avg blob size** from `IngressBytes / write-operation count` (PutBlob, PutBlock, AppendBlock, ...). For workloads dominated by block uploads, that is an approximation.
 5. **SFTP idle detection uses total transactions.** A polling script without transfers may false-positive; the recommendation says *"validate before disabling"*.
 6. **Storage Bloat multiplier** uses documented empirical factors (soft-delete +0.30×N/30, container soft-delete +0.10×N/30, versioning without lifecycle +1.5). Actual inflation depends on write pattern.
+7. **Table / Queue / File operations are not priced.** They are reported separately (`NonBlobMonthly`) and excluded from the blob read / write / other meters used in the tier and replication projections.
+8. **Cool / Cold data retrieval is estimated from `Egress`.** The metric also includes egress within Azure, so it is an upper-bound proxy for GB read.
+9. **Changing the default access tier is itself billed** (write operations when moving to a cooler tier, read operations plus retrieval when moving to a warmer one for blobs with an inferred tier). That one-time cost is not part of the monthly savings.
 
 ---
 
 ## Version history
 
+- **v3.2 (script v1.1.0)** — Fixed the ApiName parsing that reported 0 reads / 0 writes (the dimension name is `Metadatavalues[].Name.Value`, not `.Name`); billing-accurate operation classification; breakdown reconciled against the total and withheld (`n/a`) when unavailable; metric failures surfaced instead of swallowed; added "other operations" and Cool/Cold data-retrieval cost; refreshed list prices and redundancy multipliers; `-PricingOverride` now reaches the parallel workers; failed / classic accounts listed in the report banner; dollar amounts restored in finding text; overlapping savings no longer double counted.
 - **v3.1** — Storage Bloat / Blob Inventory / Orphan PE findings, HTTP 429 backoff with jitter, `-PricingOverride`, `-DryRun`, SHA-256 sidecar (paradox-free), `Az.CostManagement` fallback, ETA in progress bar. 30+ automated audit checks.
 - **v3.0** — Parallel `ForEach-Object -Parallel` with per-subscription batching, batched Get-AzMetric (3 calls instead of 6), scope selector on the Overview screen.
 - **v2.x** — Bulk actions card, remediation `.sh` bundle, snapshot compare, capacity forecast widget, real-cost via `Az.Billing`, checkpoint + `-Resume`.
